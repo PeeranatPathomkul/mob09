@@ -11,6 +11,7 @@ ENV NODE_ENV=production
 COPY package*.json ./
 RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist
+COPY --from=build /app/seed ./seed
 
 # Default command runs the HTTP API (api1/api2/api3).
 # The worker service overrides this with: node dist/worker.main

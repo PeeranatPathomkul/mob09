@@ -1,13 +1,16 @@
-import { Check, Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
+import { Check, Column, Entity, PrimaryColumn } from 'typeorm';
 
 @Entity('products')
 @Check('remaining_stock >= 0')
 export class Product {
-  @PrimaryGeneratedColumn('uuid')
+  @PrimaryColumn()
   id: string;
 
   @Column()
   name: string;
+
+  @Column('text')
+  description: string;
 
   @Column('decimal', { precision: 10, scale: 2 })
   price: string;
@@ -17,6 +20,9 @@ export class Product {
 
   @Column({ name: 'remaining_stock', type: 'int' })
   remainingStock: number;
+
+  @Column({ name: 'is_flash_sale_active', type: 'boolean', default: false })
+  isFlashSaleActive: boolean;
 
   @Column({ name: 'created_at', type: 'timestamptz', default: () => 'now()' })
   createdAt: Date;
