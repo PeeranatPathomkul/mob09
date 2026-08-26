@@ -1,0 +1,15 @@
+{
+  "name": "bull-board",
+  "version": "0.0.1",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@bull-board/api": "^6.7.2",
+    "@bull-board/express": "^6.7.2",
+    "bullmq": "^5.34.10",
+    "express": "^4.21.2"
+  }
+}
