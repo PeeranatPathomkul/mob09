@@ -1,1 +1,2 @@
 winget install GrafanaLabs.k6
+k6 run -e BASE_URL=http://localhost:8080 load-test/orders-50.js
