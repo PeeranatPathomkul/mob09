@@ -1,95 +1,118 @@
-import { Processor, WorkerHost } from '@nestjs/bullmq';
+import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
 import { Inject, Logger } from '@nestjs/common';
-import { InjectDataSource } from '@nestjs/typeorm';
-import { DataSource } from 'typeorm';
 import { Job } from 'bullmq';
 import { Redis } from 'ioredis';
 import { REDIS_CLIENT } from '../redis/redis.module';
-import { Order, OrderStatus } from './entities/order.entity';
-import { Product } from '../products/entities/product.entity';
-import { ProductsService } from '../products/products.service';
+import { ORDERS_QUEUE } from './orders.module';
+import { ClaimResult, StockClaimService } from './stock-claim.service';
+import { ReplayDetectedError } from './order-errors';
 
-interface ProcessOrderJobData {
+export interface ProcessOrderJobData {
   userId: string;
   productId: string;
-  quantity: number;
+  /**
+   * Token of the Redis lock the API layer took before enqueuing, so this
+   * worker can release exactly that lock and no other. Optional because the
+   * current producer does not send one yet — see the note on releaseLock().
+   */
+  lockToken?: string;
+  /** Present on older jobs; the business rule fixes quantity at 1. */
+  quantity?: number;
 }
 
-const STOCK_LOCK_TTL_MS = 10_000;
+/**
+ * Release a distributed lock only if we still own it.
+ *
+ * A bare DEL is unsafe: if the lock's TTL expires while this job is still
+ * running and the user retries, a *new* lock appears under the same key. DEL
+ * would delete that one, letting the same user through a second time. The
+ * compare makes the delete a no-op unless the value is still ours.
+ */
+const RELEASE_LOCK_SCRIPT = `
+if redis.call("get", KEYS[1]) == ARGV[1] then
+  return redis.call("del", KEYS[1])
+else
+  return 0
+end
+`;
 
-@Processor('orders')
+const WORKER_CONCURRENCY = Number(process.env.WORKER_CONCURRENCY ?? 10);
+
+@Processor(ORDERS_QUEUE, { concurrency: WORKER_CONCURRENCY })
 export class OrdersProcessor extends WorkerHost {
   private readonly logger = new Logger(OrdersProcessor.name);
+  private readonly cacheVersionKey: string;
 
   constructor(
-    @InjectDataSource() private readonly dataSource: DataSource,
+    private readonly stockClaim: StockClaimService,
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
-    private readonly productsService: ProductsService,
   ) {
     super();
+    this.cacheVersionKey = process.env.CACHE_VERSION_KEY ?? 'products:cache:version';
+    this.logger.log(
+      `concurrency=${WORKER_CONCURRENCY} strategy=${this.stockClaim.getStrategy()} cacheVersionKey=${this.cacheVersionKey}`,
+    );
   }
 
-  async process(job: Job<ProcessOrderJobData>): Promise<void> {
-    const { userId, productId, quantity } = job.data;
-    this.logger.log(`Processing order job ${job.id} for user=${userId} product=${productId} qty=${quantity}`);
-
-    const lockKey = `stock-lock:${productId}`;
-    const lockToken = `${job.id}:${Date.now()}`;
-
-    // Redis distributed lock (SET NX PX) — serializes concurrent workers
-    // touching the same product's stock.
-    const gotLock = await this.redis.set(lockKey, lockToken, 'PX', STOCK_LOCK_TTL_MS, 'NX');
-    if (gotLock !== 'OK') {
-      // Another worker is mid-update for this product. Throw so BullMQ
-      // retries the job instead of racing the current lock holder.
-      throw new Error(`Could not acquire stock lock for product ${productId}, will retry`);
-    }
+  async process(job: Job<ProcessOrderJobData>): Promise<ClaimResult> {
+    const { userId, productId, lockToken } = job.data;
+    const jobId = String(job.id);
 
     try {
-      await this.dataSource.transaction(async (manager) => {
-        // Atomic conditional decrement: only matches (and only decrements)
-        // if enough stock remains. This is the real guarantee against
-        // overselling — it holds even if the Redis lock above were ever
-        // bypassed or its TTL expired mid-operation.
-        const updateResult = await manager
-          .createQueryBuilder()
-          .update(Product)
-          .set({ remainingStock: () => 'remaining_stock - :quantity' })
-          .where('id = :productId AND remaining_stock >= :quantity')
-          .setParameters({ productId, quantity })
-          .execute();
-
-        if (updateResult.affected === 0) {
-          throw new Error(`Insufficient stock for product ${productId}`);
+      let result: ClaimResult;
+      try {
+        result = await this.stockClaim.claim(userId, productId, jobId);
+      } catch (err) {
+        if (err instanceof ReplayDetectedError) {
+          // This job already committed in an earlier run and crashed before
+          // BullMQ recorded it. The transaction that just ran was rolled
+          // back, so nothing was double-counted. The order exists and is
+          // correct: report success.
+          this.logger.warn(`job ${jobId} replayed; order ${err.orderId} already committed`);
+          return { orderId: err.orderId, remainingStock: -1, replayed: true, attempts: 1 };
         }
-
-        const order = manager.create(Order, {
-          userId,
-          productId,
-          quantity,
-          status: OrderStatus.CONFIRMED,
-        });
-
-        // @Unique(['userId', 'productId']) on Order is the last line of
-        // defense against a duplicate purchase slipping past the Redis
-        // lock in orders.service.ts (e.g. after that lock's TTL expires).
-        await manager.save(order);
-      });
-
-      // Stock changed — drop cached product pages so GET /products reflects
-      // the new remainingStock immediately.
-      await this.productsService.invalidateProductCache();
-    } catch (err) {
-      this.logger.warn(`Order job ${job.id} failed: ${(err as Error).message}`);
-      throw err;
-    } finally {
-      // Only release the lock if we still hold it (best-effort check-then-
-      // delete; a Lua compare-and-delete script would be safer under heavy
-      // contention, but this is sufficient given the short TTL here).
-      const current = await this.redis.get(lockKey);
-      if (current === lockToken) {
-        await this.redis.del(lockKey);
+        throw err;
       }
+
+      // Strictly after the commit. Bumping the cache version before it would
+      // invalidate readers on the strength of a write that might still roll
+      // back — and a reader could then refill the cache from the pre-commit
+      // state, leaving a stale entry that outlives the transaction.
+      await this.bumpCacheVersion();
+
+      return result;
+    } finally {
+      // Runs on every path, success or failure, so a user is never left
+      // locked out waiting for the TTL after their job has already resolved.
+      await this.releaseLock(userId, productId, lockToken);
     }
+  }
+
+  private async bumpCacheVersion(): Promise<void> {
+    try {
+      await this.redis.incr(this.cacheVersionKey);
+    } catch (err) {
+      // The stock change is already committed and correct; a failed cache
+      // bump must not fail the job. Readers fall back to their TTL.
+      this.logger.error(`cache version bump failed: ${(err as Error).message}`);
+    }
+  }
+
+  private async releaseLock(userId: string, productId: string, lockToken?: string): Promise<void> {
+    if (!lockToken) return; // producer did not send one — nothing we can prove ownership of
+    try {
+      await this.redis.eval(RELEASE_LOCK_SCRIPT, 1, `lock:order:${userId}:${productId}`, lockToken);
+    } catch (err) {
+      // Never let cleanup mask the real outcome of the job.
+      this.logger.error(`lock release failed for ${userId}/${productId}: ${(err as Error).message}`);
+    }
+  }
+
+  @OnWorkerEvent('failed')
+  onFailed(job: Job<ProcessOrderJobData> | undefined, err: Error) {
+    // err.name carries the taxonomy (OUT_OF_STOCK, DUPLICATE_ORDER, ...), so
+    // Bull Board shows why a job failed instead of one undifferentiated wall
+    // of red — that breakdown is the evidence for the report.
+    this.logger.warn(`job ${job?.id ?? '?'} failed [${err.name}] ${err.message}`);
   }
 }

@@ -36,6 +36,16 @@ services:
       context: ./api
     command: ["node", "dist/worker.main"]
     env_file: .env
+    # Listed explicitly (and not only in .env) so a benchmark sweep can
+    # override them per run — `environment` wins over `env_file`, so
+    # `WORKER_CONCURRENCY=32 docker compose up -d worker` takes effect
+    # without editing .env or rebuilding the image.
+    environment:
+      - STOCK_CLAIM_STRATEGY=${STOCK_CLAIM_STRATEGY:-pessimistic}
+      - WORKER_CONCURRENCY=${WORKER_CONCURRENCY:-10}
+      - DB_POOL_MAX=${DB_POOL_MAX:-12}
+      - DB_LOCK_TIMEOUT=${DB_LOCK_TIMEOUT:-5s}
+      - CACHE_VERSION_KEY=${CACHE_VERSION_KEY:-products:cache:version}
     depends_on:
       - postgres
       - redis

@@ -1,4 +1,7 @@
 {
   "extends": "./tsconfig.json",
-  "exclude": ["node_modules", "test", "dist", "**/*spec.ts"]
+  // `bench` is excluded on purpose: it is a ts-node dev tool, and compiling it
+  // would pull the common rootDir up from `src/` to the package root, moving
+  // every build output to dist/src/** and breaking `node dist/main`.
+  "exclude": ["node_modules", "test", "dist", "bench", "**/*spec.ts"]
 }
