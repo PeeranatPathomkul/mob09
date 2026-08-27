@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Put the system back to a known pre-load state.
 #
-#   ./api/bench/reset.sh
+#   ./load-test/reset.sh
 #
 # Clearing bull:orders:* matters more than it looks: measure.ts derives the
 # throughput window from min(processedOn)/max(finishedOn) across every job in
@@ -9,7 +9,7 @@
 # and quietly deflate the result.
 set -euo pipefail
 
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/.."
 
 PG_SVC=${PG_SVC:-postgres}
 REDIS_SVC=${REDIS_SVC:-redis}

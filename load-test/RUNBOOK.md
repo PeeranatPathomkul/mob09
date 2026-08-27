@@ -1,164 +1,123 @@
 # Load-test runbook
 
-## 0. Install k6 (once)
+Everything lives in this folder. Run every command **from the repo root**.
 
-Windows:
+| File | What it's for |
+|---|---|
+| `orders-50.js` | 50-user warm-up — check the write path works before the real run |
+| `orders-500.js` | **Spec write load**: 500 users race for `p-1001` (50 units) |
+| `orders-duplicate-lock.js` | Proves the entry lock collapses a triple-click into one job |
+| `products-read.js` | **Spec read load**: 1,000 concurrent users on the cached product list |
+| `lost-jobs-check.js` | Catches silently-dying jobs — see "Why this one exists" below |
+| `reset.sh` | Put DB + Redis back to a clean pre-load state |
+| `verify.sql` | Data Integrity Proof (the 5 required queries) |
+| `measure.js` | Throughput / p50 / p95 / failure breakdown from the queue |
+| `sweep.sh` | Automated benchmark sweep, writes CSV |
 
-```powershell
-winget install k6 --source winget
-# or: choco install k6
-```
-
-Verify: `k6 version`. Open a **new** terminal afterwards so PATH refreshes.
-
-No k6 and can't install it? See "Fallback without k6" at the bottom.
+Prerequisites: `winget install GrafanaLabs.k6`, then open a **new** terminal.
 
 ---
 
-## 1. Bring the stack up
+## 1. Start and seed
 
 ```bash
 docker compose up -d --build
-```
-
-Wait until all 8 containers are healthy:
-
-```bash
-docker compose ps
-```
-
-## 2. Seed the products
-
-```bash
 docker compose exec api1 node dist/database/seed.js
 ```
 
-`p-1001` must start at 50 units — check it:
+## 2. Reset before EVERY run
 
 ```bash
-docker compose exec postgres psql -U postgres -d flash_sale -c \
-  "SELECT id, remaining_stock FROM products WHERE id IN ('p-1001','p-1003');"
+bash load-test/reset.sh
 ```
 
-> Re-run the seed before **every** test run. It upserts, so it resets stock
-> back to the seed values. Also clear old orders first:
-> ```bash
-> docker compose exec postgres psql -U postgres -d flash_sale -c "TRUNCATE orders;"
-> docker compose exec redis redis-cli FLUSHALL
-> ```
+On PowerShell you need the `bash` prefix (or use Git Bash).
 
----
+Clearing `bull:orders:*` matters: `measure.js` derives its throughput window
+from `min(processedOn)`/`max(finishedOn)` across every job still in the queue,
+so leftovers from the previous run would stretch that window and understate
+the result.
 
-## 3. Read load — spec section 3
-
-1,000 concurrent users on the cached product list.
+## 3. Run the load
 
 ```bash
+# warm-up
+k6 run -e BASE_URL=http://localhost:8080 load-test/orders-50.js
+
+# read load — 1,000 concurrent
 k6 run -e BASE_URL=http://localhost:8080 load-test/products-read.js
-```
 
-Report from the k6 summary: `http_reqs` rate (Req/s), `http_req_duration` p(95),
-`http_req_failed` rate (Error Rate).
-
-## 4. Write load — spec section 3
-
-500 unique users racing for `p-1001` (50 units); the first 20 fire 3 requests each.
-
-```bash
+# write load — 500 users vs 50 units
 k6 run -e BASE_URL=http://localhost:8080 load-test/orders-500.js
+
+# duplicate guard — one user, 3 simultaneous clicks
+k6 run -e BASE_URL=http://localhost:8080 -e PRODUCT_ID=p-1001 \
+       -e DUPLICATE_COUNT=3 load-test/orders-duplicate-lock.js
 ```
 
-Every request should come back **202 Accepted**. The API only queues here, so
-this measures the entry path, not the stock decrement.
+## 4. Wait for the queue to drain
 
-## 5. Wait for the queue, then prove integrity
-
-The write load finishes long before the worker does. Watch Bull Board at
+The load finishes long before the worker does. Watch
 <http://localhost:4001/admin/queues> until `waiting` and `active` are both 0.
 
-Then:
+## 5. Collect the evidence
 
 ```bash
+# Data Integrity Proof
 docker compose exec -T postgres psql -U postgres -d flash_sale < load-test/verify.sql
+
+# throughput, p50/p95, failures by reason
+node load-test/measure.js
 ```
 
-Expected:
+Expected after `orders-500.js`:
 
 | Check | Expected |
 |---|---|
 | `remaining_stock` of `p-1001` | exactly `0` |
-| orders for `p-1001` | `50` |
-| distinct users | `50` |
+| orders / distinct users | `50` / `50` |
 | anyone with >1 order | 0 rows |
-| any product with negative stock | 0 rows |
-| `remaining_stock + sold` | `50` |
+| consumed vs sold drift | `0` |
+| `measure.js` failures | 450 × `OUT_OF_STOCK`, `retried 0` |
 
 ---
 
-## 6. Lost-jobs check (worker/DB diagnostic)
-
-The spec scenario cannot distinguish "sold out correctly" from "jobs silently
-died", because 450 of the 500 users were always going to lose. This one can.
+## Benchmark sweeps
 
 ```bash
-docker compose exec postgres psql -U postgres -d flash_sale -c "TRUNCATE orders;"
-docker compose exec redis redis-cli FLUSHALL
-docker compose exec api1 node dist/database/seed.js
-
-k6 run -e BASE_URL=http://localhost:8080 load-test/lost-jobs-check.js
+bash load-test/sweep.sh strategy      # pessimistic vs optimistic vs atomic
+bash load-test/sweep.sh concurrency   # 1,2,4,8,16,32
 ```
 
-`p-1003` has 500 units and 500 users want one each, so the only correct
-outcome is everybody wins:
+Each run resets, restarts the worker with new env, loads, waits, measures, and
+appends a row to `bench-results.csv`. No rebuild needed — the worker reads
+`STOCK_CLAIM_STRATEGY` / `WORKER_CONCURRENCY` / `DB_POOL_MAX` from the
+environment (see the `worker` service in `docker-compose.yml`).
+
+## Why `lost-jobs-check.js` exists
+
+The spec scenario cannot tell "sold out correctly" apart from "jobs silently
+died", because 450 of the 500 users were always going to lose. This one can:
+`p-1003` holds 500 units and 500 users each want one, so the only correct
+outcome is **500 orders, `remaining_stock` 0**. Any shortfall means jobs were
+lost, not that stock ran out.
 
 ```bash
+bash load-test/reset.sh
+k6 run -e BASE_URL=http://localhost:8080 load-test/lost-jobs-check.js
 docker compose exec postgres psql -U postgres -d flash_sale -c \
   "SELECT remaining_stock FROM products WHERE id='p-1003';"   -- must be 0
-docker compose exec postgres psql -U postgres -d flash_sale -c \
-  "SELECT count(*) FROM orders WHERE product_id='p-1003';"    -- must be 500
 ```
 
-If `remaining_stock > 0` here, jobs are being lost. Check why in Bull Board:
-`failedReason` of `Insufficient stock` is legitimate; `Could not acquire stock
-lock` is not — it means the job died without ever being retried.
+In Bull Board, `OUT_OF_STOCK` is a legitimate failure; anything else on this
+run is a bug.
 
----
-
-## 7. Numbers to collect for the report
-
-| Requirement | Where it comes from |
-|---|---|
-| Req/s, p95 latency, error rate | k6 summary (steps 3 and 4) |
-| Jobs waiting / completed / failed | Bull Board, or `redis-cli ZCARD bull:orders:completed` / `bull:orders:failed` |
-| Cache hit / miss ratio | needs instrumentation in `products.service.ts` — not built yet |
-| Data integrity proof | step 5 |
-
-Queue counters straight from Redis:
+## Queue counters by hand
 
 ```bash
 docker compose exec redis redis-cli LLEN  bull:orders:wait
 docker compose exec redis redis-cli LLEN  bull:orders:active
 docker compose exec redis redis-cli ZCARD bull:orders:completed
 docker compose exec redis redis-cli ZCARD bull:orders:failed
-```
-
-Why a job failed:
-
-```bash
 docker compose exec redis redis-cli HGET "bull:orders:order:user-7:p-1001" failedReason
 ```
-
----
-
-## Fallback without k6
-
-`node-load.js` reproduces the write load using plain Node (v18+, uses global
-`fetch`). It is less capable than k6 — no p95, no thresholds — but it is enough
-to drive the queue and prove data integrity.
-
-```bash
-node load-test/node-load.js                          # 500 users vs p-1001
-node load-test/node-load.js --product p-1003 --users 500   # lost-jobs check
-```
-
-Point it elsewhere with `--base http://localhost:8080`.

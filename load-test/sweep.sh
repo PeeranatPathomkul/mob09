@@ -2,14 +2,14 @@
 # Automated benchmark sweep. Resets, loads, waits for drain, measures — once
 # per configuration — and appends every result to one CSV.
 #
-#   ./api/bench/sweep.sh strategy       # pessimistic vs optimistic vs atomic
-#   ./api/bench/sweep.sh concurrency    # 1,2,4,8,16,32 on the chosen strategy
+#   ./load-test/sweep.sh strategy       # pessimistic vs optimistic vs atomic
+#   ./load-test/sweep.sh concurrency    # 1,2,4,8,16,32 on the chosen strategy
 #
 # Each configuration is applied by restarting the worker with new env, so no
 # rebuild is needed between runs.
 set -euo pipefail
 
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/.."
 
 MODE=${1:-strategy}
 OUT=${OUT:-bench-results.csv}
@@ -25,7 +25,7 @@ run_one() {
   echo ""
   echo "############ $label ############"
 
-  ./api/bench/reset.sh > /dev/null
+  ./load-test/reset.sh > /dev/null
 
   echo "==> restarting worker: strategy=$strategy concurrency=$concurrency pool=$pool"
   STOCK_CLAIM_STRATEGY="$strategy" \
@@ -35,12 +35,11 @@ run_one() {
   sleep 5
 
   echo "==> load"
-  if command -v k6 > /dev/null 2>&1; then
-    k6 run -e BASE_URL="$BASE_URL" "$LOAD_SCRIPT" --quiet || true
-  else
-    echo "    k6 not found, using node fallback"
-    node load-test/node-load.js --base "$BASE_URL" > /dev/null
+  if ! command -v k6 > /dev/null 2>&1; then
+    echo "    k6 not found — install it with: winget install GrafanaLabs.k6" >&2
+    exit 1
   fi
+  k6 run -e BASE_URL="$BASE_URL" "$LOAD_SCRIPT" --quiet || true
 
   echo "==> waiting for drain"
   for _ in $(seq 1 90); do
@@ -53,8 +52,8 @@ run_one() {
   sleep 2
 
   echo "==> measure"
-  ( cd api && STOCK_CLAIM_STRATEGY="$strategy" WORKER_CONCURRENCY="$concurrency" DB_POOL_MAX="$pool" \
-      npx ts-node bench/measure.ts --csv "../$OUT" --label "$label" )
+  STOCK_CLAIM_STRATEGY="$strategy" WORKER_CONCURRENCY="$concurrency" DB_POOL_MAX="$pool" \
+    node load-test/measure.js --csv "$OUT" --label "$label"
 
   echo "==> integrity"
   docker compose exec -T postgres psql -U "${DB_USERNAME:-postgres}" -d "${DB_DATABASE:-flash_sale}" -c \
