@@ -10,20 +10,20 @@ export enum OrderStatus {
 @Unique(['userId', 'productId'])
 export class Order {
   @PrimaryGeneratedColumn('uuid')
-  id: string;
+  id!: string;
 
   @Column({ name: 'user_id' })
-  userId: string;
+  userId!: string;
 
   @Column({ name: 'product_id' })
-  productId: string;
+  productId!: string;
 
   @Column({ type: 'int', default: 1 })
-  quantity: number;
+  quantity!: number;
 
   @Column({ type: 'enum', enum: OrderStatus, default: OrderStatus.PENDING })
-  status: OrderStatus;
+  status!: OrderStatus;
 
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
-  createdAt: Date;
+  createdAt!: Date;
 }

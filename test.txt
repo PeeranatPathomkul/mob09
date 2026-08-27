@@ -1,2 +1,3 @@
 winget install GrafanaLabs.k6
 k6 run -e BASE_URL=http://localhost:8080 load-test/orders-50.js
+k6 run -e BASE_URL=http://localhost:8080 -e PRODUCT_ID=p-1001 -e DUPLICATE_COUNT=3 load-test/orders-duplicate-lock.js
