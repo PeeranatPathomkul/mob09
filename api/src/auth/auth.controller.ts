@@ -7,6 +7,7 @@ export class AuthController {
 
   @Post('token')
   token(@Body('userId') userId: string) {
-    return this.authService.issueToken(userId);
+    const { accessToken } = this.authService.issueToken(userId);
+    return { status: 'success', accessToken };
   }
 }

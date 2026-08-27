@@ -8,5 +8,8 @@ import { ProductsService } from './products.service';
   imports: [TypeOrmModule.forFeature([Product])],
   controllers: [ProductsController],
   providers: [ProductsService],
+  // Exported so OrdersWorkerModule can inject ProductsService to invalidate
+  // the product cache after a stock update commits.
+  exports: [ProductsService],
 })
 export class ProductsModule {}
