@@ -1,0 +1,3 @@
+# k6 handleSummary dumps — regenerated on every run, keep the folder not the files
+*.json
+!.gitignore

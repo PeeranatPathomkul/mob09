@@ -11,6 +11,11 @@ services:
 
   redis:
     image: redis:7-alpine
+    # Exposed so load-test/measure.js can read the queue from the host.
+    # 6380, not 6379: another project on this machine already holds 6379, and
+    # a host tool pointed at the wrong Redis silently reports an empty queue.
+    ports:
+      - "6380:6379"
     restart: unless-stopped
 
   api1: &api

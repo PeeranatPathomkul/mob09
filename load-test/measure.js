@@ -24,9 +24,12 @@ function arg(name, fallback) {
 }
 
 const QUEUE_NAME = process.env.ORDERS_QUEUE || 'orders';
+// 6380 is where docker-compose publishes this project's Redis. Do NOT default
+// to 6379: if another project is using that port, this connects to the wrong
+// Redis and reports "no finished jobs" on a run that actually worked.
 const connection = {
   host: process.env.REDIS_HOST || 'localhost',
-  port: Number(process.env.REDIS_PORT || 6379),
+  port: Number(process.env.REDIS_PORT || 6380),
 };
 
 function percentile(sorted, p) {
