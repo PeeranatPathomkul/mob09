@@ -23,6 +23,15 @@ services:
       context: ./api
     command: ["node", "dist/main"]
     env_file: .env
+    # Listed explicitly (see the worker service below for why) so a
+    # cache-tuning sweep can override them without editing .env or rebuilding.
+    environment:
+      - CACHE_VERSION_KEY=${CACHE_VERSION_KEY:-products:cache:version}
+      - PRODUCT_CACHE_TTL_MIN_SECONDS=${PRODUCT_CACHE_TTL_MIN_SECONDS:-30}
+      - PRODUCT_CACHE_TTL_MAX_SECONDS=${PRODUCT_CACHE_TTL_MAX_SECONDS:-60}
+      - PRODUCT_CACHE_LOCK_TTL_SECONDS=${PRODUCT_CACHE_LOCK_TTL_SECONDS:-5}
+      - PRODUCT_CACHE_LOCK_RETRY_MAX=${PRODUCT_CACHE_LOCK_RETRY_MAX:-5}
+      - PRODUCT_CACHE_LOCK_RETRY_DELAY_MS=${PRODUCT_CACHE_LOCK_RETRY_DELAY_MS:-50}
     expose:
       - "3000"
     depends_on:

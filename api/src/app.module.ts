@@ -7,7 +7,7 @@ import { AppService } from './app.service';
 import typeormConfig from './config/typeorm.config';
 import { RedisModule } from './redis/redis.module';
 import { AuthModule } from './auth/auth.module';
-import { ProductsModule } from './products/products.module';
+import { CacheModule } from './cache/cache.module';
 import { OrdersModule } from './orders/orders.module';
 
 // API-side root module (used by api1/api2/api3). Intentionally does NOT
@@ -31,7 +31,7 @@ import { OrdersModule } from './orders/orders.module';
     }),
     RedisModule,
     AuthModule,
-    ProductsModule,
+    CacheModule,
     OrdersModule,
   ],
   controllers: [AppController],
