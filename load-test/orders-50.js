@@ -51,7 +51,10 @@ export function setup() {
       { headers: { 'Content-Type': 'application/json' } },
     );
     const issued = check(res, {
-      [`token issued for ${userId}`]: (r) => r.status === 200 || r.status === 201,
+      // Spec 2.1 says 200 OK, so check exactly that. Accepting 201 as well is
+      // how our own 201 regression went unnoticed until another group's
+      // stricter script hit it.
+      [`token issued for ${userId}`]: (r) => r.status === 200,
     });
     tokens.push(issued ? { userId, accessToken: res.json('accessToken') } : { userId, accessToken: null });
   }
@@ -89,7 +92,9 @@ export default function (data) {
   const responses = shots > 1 ? http.batch(requests) : [http.post(requests[0].url, requests[0].body, requests[0].params)];
 
   responses.forEach((res, idx) => {
-    const queued = res.status === 200 || res.status === 201 || res.status === 202;
+    // Spec 2.3 is explicit: 202 Accepted. 200/201 here would mean the
+    // controller did the work synchronously instead of queueing it.
+    const queued = res.status === 202;
     const rejectedAsDuplicate = res.status === 409 || res.status === 429;
 
     check(res, {

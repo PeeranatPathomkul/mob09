@@ -13,14 +13,18 @@ cd "$(dirname "$0")/.."
 
 MODE=${1:-strategy}
 OUT=${OUT:-bench-results.csv}
-BASE_URL=${BASE_URL:-http://localhost:8080}
+BASE_URL=${BASE_URL:-http://nginx}
 LOAD_SCRIPT=${LOAD_SCRIPT:-load-test/orders-500.js}
 
 run_one() {
   local label="$1"
   local strategy="$2"
   local concurrency="$3"
-  local pool=$((concurrency + 2))
+  # 4th arg overrides the pool so it can be varied on its own. Without it the
+  # pool tracks concurrency, which is the right default but useless for
+  # answering "is the pool the bottleneck?" — both move together and the
+  # effect of each cannot be separated.
+  local pool="${4:-$((concurrency + 2))}"
 
   echo ""
   echo "############ $label ############"
@@ -35,11 +39,16 @@ run_one() {
   sleep 5
 
   echo "==> load"
-  if ! command -v k6 > /dev/null 2>&1; then
-    echo "    k6 not found — install it with: winget install GrafanaLabs.k6" >&2
-    exit 1
-  fi
-  k6 run -e BASE_URL="$BASE_URL" "$LOAD_SCRIPT" --quiet || true
+  # Driven from the compose network, not the host. A sweep exists to compare
+  # configurations, so the load generator must not be the thing that varies:
+  # from a Windows host ~20% of connections are refused by Docker Desktop's
+  # port forwarder, and that share moves with how fast the system replies —
+  # which would show up as a difference between configurations that is really
+  # just the client giving up.
+  MSYS_NO_PATHCONV=1 docker compose --profile loadtest run --rm \
+    -e BASE_URL="$BASE_URL" -e RAMP=0s \
+    -e OUT="/scripts/results/sweep-${label//\//-}.json" \
+    k6 "/scripts/$(basename "$LOAD_SCRIPT")" > /dev/null 2>&1 || true
 
   echo "==> waiting for drain"
   for _ in $(seq 1 90); do
@@ -74,8 +83,16 @@ case "$MODE" in
       run_one "$S/c$c" "$S" "$c"
     done
     ;;
+  pool)
+    # Concurrency pinned, pool varied — starved, matched, over-provisioned.
+    S=${STOCK_CLAIM_STRATEGY:-pessimistic}
+    C=${WORKER_CONCURRENCY:-10}
+    for p in 2 4 6 12 24 48; do
+      run_one "$S/c$C/pool$p" "$S" "$C" "$p"
+    done
+    ;;
   *)
-    echo "usage: $0 [strategy|concurrency]" >&2
+    echo "usage: $0 [strategy|concurrency|pool]" >&2
     exit 1
     ;;
 esac

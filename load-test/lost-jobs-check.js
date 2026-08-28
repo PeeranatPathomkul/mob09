@@ -38,6 +38,10 @@ export function setup() {
       JSON.stringify({ userId: `user-${i}` }),
       { headers: { 'Content-Type': 'application/json' } },
     );
+    // Spec 2.1: 200 OK exactly. See the note in orders-500.js.
+    if (res.status !== 200) {
+      throw new Error(`auth failed for user-${i}: expected 200, got ${res.status} — ${res.body}`);
+    }
     tokens.push(res.json('accessToken'));
   }
   return { tokens };

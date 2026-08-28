@@ -80,5 +80,35 @@ services:
       - api3
     restart: unless-stopped
 
+  # Load generator. Behind the "loadtest" profile so `docker compose up` never
+  # starts it — it only runs when asked for explicitly:
+  #
+  #   # our own stack (default script: orders-500.js)
+  #   docker compose --profile loadtest run --rm k6
+  #
+  #   # a different script
+  #   docker compose --profile loadtest run --rm k6 /scripts/products-read.js
+  #
+  #   # another group's system — note the :8080, since that host publishes
+  #   # nginx on a port rather than sharing this network
+  #   docker compose --profile loadtest run --rm -e BASE_URL=http://172.30.58.13:8080 k6
+  #
+  # Staying inside the compose network matters for our own stack: from the
+  # Windows host, opening 500 connections at once gets refused by Docker
+  # Desktop's port forwarder and ~20% of requests never leave the machine.
+  # From in here they all land, which is why BASE_URL defaults to the
+  # service name and not localhost:8080.
+  k6:
+    image: grafana/k6:latest
+    profiles: ["loadtest"]
+    volumes:
+      - ./load-test:/scripts
+    environment:
+      - BASE_URL=${BASE_URL:-http://nginx}
+      - RAMP=${RAMP:-0s}
+      - OUT=${OUT:-/scripts/results/k6-summary.json}
+    entrypoint: ["k6", "run"]
+    command: ["/scripts/orders-500.js"]
+
 volumes:
   postgres_data:

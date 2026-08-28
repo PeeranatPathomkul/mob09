@@ -1,4 +1,4 @@
-import { Column, CreateDateColumn, Entity, PrimaryGeneratedColumn, Unique } from 'typeorm';
+import { Column, CreateDateColumn, Entity, Index, PrimaryGeneratedColumn, Unique } from 'typeorm';
 
 export enum OrderStatus {
   PENDING = 'pending',
@@ -7,7 +7,18 @@ export enum OrderStatus {
 }
 
 @Entity('orders')
+// Enforces "one unit per user per product" and, as a side effect, creates the
+// composite (user_id, product_id) index — which is what the duplicate check
+// after a 23505 looks the row up by. No separate index is needed for it.
 @Unique(['userId', 'productId'])
+// Deliberately NOT a hot-path optimisation, and it should not be sold as one:
+// the stock decrement finds its row in `products` by primary key and never
+// touches this table's indexes. What this covers is the per-product
+// aggregation the verification queries run ("how many orders for p-1001?"),
+// which the composite index above cannot serve because product_id is its
+// trailing column. At 50 rows Postgres will still choose a seq scan; this
+// earns its keep once the table is large.
+@Index(['productId'])
 export class Order {
   @PrimaryGeneratedColumn('uuid')
   id!: string;

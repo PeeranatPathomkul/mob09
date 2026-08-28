@@ -85,6 +85,14 @@ export function setup() {
       JSON.stringify({ userId }),
       { headers: { 'Content-Type': 'application/json' } },
     );
+
+    // Fail loudly and immediately rather than collecting undefined tokens and
+    // reporting them later as order failures. Spec 2.1 says 200 OK; a 201 here
+    // means the endpoint is using Nest's @Post default instead of the
+    // documented status, which is a real spec break worth stopping on.
+    if (res.status !== 200) {
+      throw new Error(`auth failed for ${userId}: expected 200, got ${res.status} — ${res.body}`);
+    }
     tokens.push({ userId, accessToken: res.json('accessToken') });
   }
   console.log(`prepared ${tokens.length} tokens`);

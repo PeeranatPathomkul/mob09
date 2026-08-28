@@ -50,7 +50,8 @@ export function setup() {
     { headers: { 'Content-Type': 'application/json' } },
   );
 
-  const ok = check(tokenRes, { 'got auth token': (r) => r.status === 200 || r.status === 201 });
+  // Spec 2.1: 200 OK exactly.
+  const ok = check(tokenRes, { 'got auth token': (r) => r.status === 200 });
   if (!ok) {
     throw new Error(`Failed to get auth token: HTTP ${tokenRes.status} — ${tokenRes.body}`);
   }
