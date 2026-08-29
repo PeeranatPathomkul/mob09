@@ -13,12 +13,41 @@ type RedisMock = {
 };
 
 function createRedisMock(): RedisMock {
-  return {
+  const mock: RedisMock = {
     get: jest.fn().mockResolvedValue(null),
     set: jest.fn().mockResolvedValue('OK'),
     incr: jest.fn().mockResolvedValue(1),
-    eval: jest.fn().mockResolvedValue(1),
+    eval: jest.fn(),
   };
+
+  // The service reads the version and the page for it through a single Lua
+  // script. Emulating that script on top of the same get() mock means tests
+  // still seed plain keys, the way they would against a real Redis, instead
+  // of having to know the script's reply shape.
+  mock.eval.mockImplementation(
+    async (script: string, _numKeys: number, key: string, arg: string) => {
+      // The other script is the compare-and-delete lock release.
+      if (!String(script).includes('pageKey')) return 1;
+
+      const raw = (await mock.get(key)) as string | null;
+      const version =
+        raw !== null && raw !== '' && Number.isFinite(Number(raw))
+          ? String(raw)
+          : '0';
+      const pageKey = `${arg}:v:${version}`;
+      const cached = (await mock.get(pageKey)) as string | null;
+      return [version, pageKey, cached ?? ''];
+    },
+  );
+
+  return mock;
+}
+
+/** Lock releases only — the read path goes through eval() too now. */
+function lockReleaseCalls(redis: RedisMock): unknown[][] {
+  return (redis.eval.mock.calls as unknown[][]).filter((call) =>
+    String(call[0]).includes('del'),
+  );
 }
 
 function emptyPage(page = 1, limit = 10): ProductsPage {
@@ -87,7 +116,7 @@ describe('ProductCacheService', () => {
       'EX',
       expect.any(Number),
     );
-    expect(redis.eval).toHaveBeenCalledTimes(1); // compare-and-delete lock release
+    expect(lockReleaseCalls(redis)).toHaveLength(1); // compare-and-delete
     expect(redis.incr).toHaveBeenCalledWith('cache:misses');
     expect(result).toEqual({ status: 'success', ...emptyPage() });
   });
@@ -128,15 +157,18 @@ describe('ProductCacheService', () => {
     // Let all 5 reach their first blocking point: the winner inside the DB
     // call, the 4 losers inside their poll-loop sleep().
     await jest.advanceTimersByTimeAsync(0);
-    // One retry round with nothing written yet.
-    await jest.advanceTimersByTimeAsync(50);
+    // One poll round with the rebuild still in flight.
+    await jest.advanceTimersByTimeAsync(10);
 
     resolveDb(emptyPage());
-    await Promise.resolve(); // let the winner's .then chain write the cache
-    await Promise.resolve();
+    // Let the winner write the page and release the lock. Draining the
+    // microtask queue via the timer helper rather than a fixed number of
+    // Promise.resolve() hops, so this does not need updating whenever the
+    // await chain in the rebuild path changes length.
+    await jest.advanceTimersByTimeAsync(0);
 
-    // Next retry round: the losers now find the page key populated.
-    await jest.advanceTimersByTimeAsync(50);
+    // Next poll round: the losers now find the page key populated.
+    await jest.advanceTimersByTimeAsync(10);
 
     const results = await Promise.all(requests);
 
@@ -147,7 +179,7 @@ describe('ProductCacheService', () => {
   });
 
   it('lock retries exhausted: falls back to a single-flight DB read and does not write the cache', async () => {
-    jest
+    const sleepSpy = jest
       .spyOn(
         service as unknown as { sleep: (ms: number) => Promise<void> },
         'sleep',
@@ -163,6 +195,7 @@ describe('ProductCacheService', () => {
 
     const result = await service.getProductsPage(1, 10);
 
+    expect(sleepSpy).toHaveBeenCalledTimes(3); // every retry used up
     expect(productsService.findPageFromDb).toHaveBeenCalledTimes(1);
     expect(redis.set).not.toHaveBeenCalledWith(
       'products:page:1:limit:10:v:0',
@@ -170,6 +203,40 @@ describe('ProductCacheService', () => {
       expect.anything(),
       expect.anything(),
     );
+    expect(result).toEqual({ status: 'success', ...emptyPage() });
+  });
+
+  it('version moves while polling: bails out after one poll instead of waiting for a rebuild that is already stale', async () => {
+    const sleepSpy = jest
+      .spyOn(
+        service as unknown as { sleep: (ms: number) => Promise<void> },
+        'sleep',
+      )
+      .mockResolvedValue(undefined);
+
+    // This caller loses the rebuild lock, so it polls.
+    redis.set.mockImplementation((key: string) =>
+      Promise.resolve(key.startsWith('products:rebuild_lock:') ? null : 'OK'),
+    );
+
+    // A worker commits another order between the first read and the first
+    // poll, moving the version from 0 to 1.
+    let versionReads = 0;
+    redis.get.mockImplementation((key: string) => {
+      if (key === VERSION_KEY) {
+        versionReads += 1;
+        return Promise.resolve(versionReads === 1 ? '0' : '1');
+      }
+      return Promise.resolve(null); // no page cached under either version
+    });
+    productsService.findPageFromDb.mockResolvedValue(emptyPage());
+
+    const result = await service.getProductsPage(1, 10);
+
+    // Gave up on the first poll rather than spending all 3 retries waiting
+    // for a v:0 rebuild that no longer describes current stock.
+    expect(sleepSpy).toHaveBeenCalledTimes(1);
+    expect(productsService.findPageFromDb).toHaveBeenCalledTimes(1);
     expect(result).toEqual({ status: 'success', ...emptyPage() });
   });
 

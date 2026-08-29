@@ -34,6 +34,45 @@ end
 `;
 
 /**
+ * Read the version counter and the page cached under that version in ONE
+ * round trip.
+ *
+ * As two sequential GETs this cost two RTTs on every single read, which at
+ * 1,000 concurrent readers is the largest avoidable latency in the path.
+ * Bundling them also makes the pair atomic: the version can no longer move
+ * between the two reads, so the page we get back always belongs to the
+ * version we got back.
+ *
+ * The script builds the page key itself and returns it, keeping the key
+ * format in exactly one place — the caller writes back to whatever key comes
+ * out of here instead of re-deriving it and risking a mismatch.
+ *
+ * A missing or non-numeric version counts as 0, and a cache miss comes back
+ * as an empty string: a nil inside a Lua table truncates the reply array,
+ * and a real cached body is always JSON, never empty.
+ *
+ * Note: the page key is computed inside the script rather than declared in
+ * KEYS, which standalone Redis allows but Redis Cluster does not. That is
+ * fine here (docker-compose runs a single redis service) — but a move to
+ * Cluster would need the version read split back out so both keys can be
+ * declared, and they would have to hash to the same slot.
+ */
+const READ_PAGE_SCRIPT = `
+local version = redis.call("get", KEYS[1])
+if not version or not tonumber(version) then version = "0" end
+local pageKey = ARGV[1] .. ":v:" .. version
+local cached = redis.call("get", pageKey)
+return { version, pageKey, cached or "" }
+`;
+
+/** One atomic look at the version counter and the page cached under it. */
+interface PageSnapshot {
+  version: number;
+  pageKey: string;
+  cached: string | null;
+}
+
+/**
  * Read-path cache for GET /api/v1/products: hybrid page cache + version
  * counter.
  *
@@ -75,10 +114,10 @@ export class ProductCacheService {
       this.config.get('PRODUCT_CACHE_LOCK_TTL_SECONDS') ?? 5,
     );
     this.lockRetryMax = Number(
-      this.config.get('PRODUCT_CACHE_LOCK_RETRY_MAX') ?? 5,
+      this.config.get('PRODUCT_CACHE_LOCK_RETRY_MAX') ?? 3,
     );
     this.lockRetryDelayMs = Number(
-      this.config.get('PRODUCT_CACHE_LOCK_RETRY_DELAY_MS') ?? 50,
+      this.config.get('PRODUCT_CACHE_LOCK_RETRY_DELAY_MS') ?? 10,
     );
   }
 
@@ -86,31 +125,21 @@ export class ProductCacheService {
     page: number,
     limit: number,
   ): Promise<ProductsPageResponse> {
-    let version: number;
+    let snapshot: PageSnapshot;
     try {
-      version = await this.readVersion();
+      snapshot = await this.readPage(page, limit);
     } catch (err) {
       await this.incrErrors(err);
       return this.singleFlightFetch(page, limit);
     }
 
-    const pageKey = this.pageKey(page, limit, version);
-
-    let cached: string | null;
-    try {
-      cached = await this.redis.get(pageKey);
-    } catch (err) {
-      await this.incrErrors(err);
-      return this.singleFlightFetch(page, limit);
-    }
-
-    if (cached) {
+    if (snapshot.cached) {
       this.incrCounter('cache:hits');
-      return JSON.parse(cached) as ProductsPageResponse;
+      return JSON.parse(snapshot.cached) as ProductsPageResponse;
     }
 
     this.incrCounter('cache:misses');
-    return this.rebuildOrWait(page, limit, version, pageKey);
+    return this.rebuildOrWait(page, limit, snapshot);
   }
 
   /** Called after a stock-changing write commits — bumps the version so every cached page for it goes stale at once. */
@@ -153,9 +182,9 @@ export class ProductCacheService {
   private async rebuildOrWait(
     page: number,
     limit: number,
-    version: number,
-    pageKey: string,
+    snapshot: PageSnapshot,
   ): Promise<ProductsPageResponse> {
+    const { version, pageKey } = snapshot;
     const lockKey = this.lockKey(page, limit, version);
     const token = randomUUID();
 
@@ -200,17 +229,24 @@ export class ProductCacheService {
     for (let attempt = 0; attempt < this.lockRetryMax; attempt++) {
       await this.sleep(this.lockRetryDelayMs);
 
-      let polled: string | null;
+      let polled: PageSnapshot;
       try {
-        polled = await this.redis.get(pageKey);
+        polled = await this.readPage(page, limit);
       } catch (err) {
         await this.incrErrors(err);
         return this.singleFlightFetch(page, limit);
       }
 
-      if (polled) {
+      // The worker committed another order while we slept. Whatever the lock
+      // holder is about to write belongs to the version we came in on, which
+      // is already stale — stop waiting for it and read through to the DB.
+      if (polled.version !== version) {
+        return this.singleFlightFetch(page, limit);
+      }
+
+      if (polled.cached) {
         this.incrCounter('cache:hits');
-        return JSON.parse(polled) as ProductsPageResponse;
+        return JSON.parse(polled.cached) as ProductsPageResponse;
       }
     }
 
@@ -251,14 +287,28 @@ export class ProductCacheService {
 
   // -- redis plumbing --
 
-  private async readVersion(): Promise<number> {
-    const raw = await this.redis.get(this.cacheVersionKey);
-    const version = Number(raw);
-    return Number.isFinite(version) ? version : 0;
+  private async readPage(page: number, limit: number): Promise<PageSnapshot> {
+    const [versionRaw, pageKey, cached] = (await this.redis.eval(
+      READ_PAGE_SCRIPT,
+      1,
+      this.cacheVersionKey,
+      this.pagePrefix(page, limit),
+    )) as [string, string, string];
+
+    return {
+      // The Lua guard already forced this to a numeric string.
+      version: Number(versionRaw),
+      pageKey,
+      cached: cached === '' ? null : cached,
+    };
   }
 
-  private pageKey(page: number, limit: number, version: number): string {
-    return `products:page:${page}:limit:${limit}:v:${version}`;
+  /**
+   * Everything in the page key except the `:v:<version>` suffix, which
+   * READ_PAGE_SCRIPT appends from whatever version it read.
+   */
+  private pagePrefix(page: number, limit: number): string {
+    return `products:page:${page}:limit:${limit}`;
   }
 
   private lockKey(page: number, limit: number, version: number): string {
