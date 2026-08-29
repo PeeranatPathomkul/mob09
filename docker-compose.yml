@@ -110,6 +110,13 @@ services:
   k6:
     image: grafana/k6:latest
     profiles: ["loadtest"]
+    # The image runs as uid 12345 (k6), but ./load-test is owned by whoever
+    # cloned the repo -- root on the Linux box. A 0755 results/ then refuses
+    # the uid-12345 write and k6 ends the run with "could not open
+    # '/scripts/results/k6-summary.json': permission denied", losing the
+    # summary JSON after the load has already been generated. Running as root
+    # sidesteps the uid mismatch on every host we test from.
+    user: root
     volumes:
       - ./load-test:/scripts
     environment:
@@ -117,7 +124,7 @@ services:
       - RAMP=${RAMP:-0s}
       - OUT=${OUT:-/scripts/results/k6-summary.json}
     entrypoint: ["k6", "run"]
-    command: ["/scripts/orders-500.js"]
+    command: ["/scripts/moo_ja_test.js"]
 
 volumes:
   postgres_data:
