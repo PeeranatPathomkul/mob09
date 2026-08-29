@@ -38,9 +38,41 @@ const STRICT_AUTH = (__ENV.STRICT_AUTH || 'true') !== 'false';
 const WRITE_START = __ENV.WRITE_START || '5s';
 
 const accepted = new Counter('orders_accepted');
+// 409 and 429 are counted apart on purpose. Lumping them reads a rate limiter
+// as a working duplicate guard: a run against another group's system reported
+// "88 duplicates blocked" when only 40 duplicate clicks were ever fired, and
+// the extra 48 were 429s from their rate limiter.
 const rejectedDuplicate = new Counter('orders_rejected_duplicate');
+const rateLimited = new Counter('orders_rate_limited');
+const unauthorized = new Counter('orders_rejected_auth');
+const badRequest = new Counter('orders_rejected_bad_request');
+const serverError = new Counter('orders_server_error');
 const failedOther = new Counter('orders_failed_other');
 const readShapeOk = new Rate('read_shape_ok');
+
+// "other failures: 452" is not a diagnosis. Each VU prints at most one
+// unexpected response so the status and body reach the console without 500
+// VUs flooding it.
+const SAMPLE_BODY_CHARS = 200;
+let sampledThisVu = false;
+
+function classifyWrite(res, userId, attempt) {
+  if (res.status === 202) { accepted.add(1); return true; }
+  if (res.status === 409) { rejectedDuplicate.add(1); return true; }
+
+  if (res.status === 429) rateLimited.add(1);
+  else if (res.status === 401 || res.status === 403) unauthorized.add(1);
+  else if (res.status === 400 || res.status === 404 || res.status === 422) badRequest.add(1);
+  else if (res.status >= 500) serverError.add(1);
+  else failedOther.add(1);
+
+  if (!sampledThisVu) {
+    sampledThisVu = true;
+    const body = res.body === null ? '<no response>' : String(res.body).slice(0, SAMPLE_BODY_CHARS);
+    console.error(`write rejected ${res.status} (${userId} attempt ${attempt}): ${body}`);
+  }
+  return false;
+}
 
 export const options = {
   scenarios: {
@@ -162,14 +194,12 @@ export function writeLoad(data) {
       : [http.post(`${BASE_URL}/api/v1/orders`, body, params)];
 
   responses.forEach((res, i) => {
-    const queued = res.status === 202;
-    const dup = res.status === 409 || res.status === 429;
+    // 202 (queued) and 409 (duplicate refused) are both correct answers; a
+    // 429 is not — it means the system shed our load rather than handling it.
+    const ok = classifyWrite(res, me.userId, i + 1);
     check(res, {
-      [`write: ${me.userId} attempt ${i + 1} accepted or duplicate-rejected`]: () => queued || dup,
+      [`write: ${me.userId} attempt ${i + 1} accepted or duplicate-rejected`]: () => ok,
     });
-    if (queued) accepted.add(1);
-    else if (dup) rejectedDuplicate.add(1);
-    else failedOther.add(1);
   });
 
   sleep(1);
@@ -198,9 +228,15 @@ export function handleSummary(data) {
     `    POST /orders       p95 ${n(writeP95)} ms`,
     `    write is           ${n(ratio)}x the read latency`,
     '',
-    `    orders accepted    ${g('orders_accepted', 'count')}`,
-    `    duplicates blocked ${g('orders_rejected_duplicate', 'count')}`,
-    `    other failures     ${g('orders_failed_other', 'count')}`,
+    `    orders accepted    ${g('orders_accepted', 'count')}   (202)`,
+    `    duplicates blocked ${g('orders_rejected_duplicate', 'count')}   (409)`,
+    '',
+    '    rejected — every line below is the system failing, not passing:',
+    `      rate limited     ${g('orders_rate_limited', 'count')}   (429)`,
+    `      auth refused     ${g('orders_rejected_auth', 'count')}   (401/403)`,
+    `      bad request      ${g('orders_rejected_bad_request', 'count')}   (400/404/422)`,
+    `      server error     ${g('orders_server_error', 'count')}   (5xx)`,
+    `      unclassified     ${g('orders_failed_other', 'count')}`,
     '',
     '    202 counts jobs queued, not units sold — confirm the real outcome',
     '    in the database with load-test/verify.sql',
