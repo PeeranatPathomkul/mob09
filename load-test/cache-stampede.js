@@ -62,6 +62,28 @@ function getStats() {
   return res.status === 200 ? res.json() : { hits: NaN, misses: NaN };
 }
 
+/**
+ * Compare two /products bodies field by field, never via JSON.stringify.
+ *
+ * k6 runs on goja and res.json() hands back Go maps, whose key iteration
+ * order Go randomises on purpose. Stringifying `meta` (or the whole body)
+ * therefore produces a different string on every call for byte-identical
+ * payloads — see cache-hit-miss.js's `describe()`/`sameData()`, which this
+ * mirrors. An earlier version of this script compared via JSON.stringify and
+ * reported ~50% "different" payloads that were not actually different.
+ */
+function samePage(a, b) {
+  const da = a.data || [];
+  const db = b.data || [];
+  if (da.length !== db.length) return false;
+  const ma = a.meta || {};
+  const mb = b.meta || {};
+  if (a.status !== b.status || ma.total !== mb.total || ma.page !== mb.page || ma.limit !== mb.limit || ma.totalPages !== mb.totalPages) {
+    return false;
+  }
+  return da.every((p, i) => p.productId === db[i].productId && p.remainingStock === db[i].remainingStock);
+}
+
 export default function () {
   console.log(`stampede probe: page=${PAGE} limit=${LIMIT} (fresh key) burst=${BURST}`);
 
@@ -94,7 +116,7 @@ export default function () {
     if (firstBody === null) {
       firstBody = body;
       identicalCount = 1;
-    } else if (JSON.stringify(body.meta) === JSON.stringify(firstBody.meta) && body.data.length === firstBody.data.length) {
+    } else if (samePage(body, firstBody)) {
       identicalCount++;
     }
   });
