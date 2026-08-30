@@ -19,6 +19,7 @@ Everything lives in this folder. Run every command **from the repo root**.
 | `test-1-moo-cache.sh` | Runs both cache scripts + a `pg_stat_user_tables.seq_scan` before/after check, prints everything person 1 needs for the report |
 | `test-2-kao-lock.sh` | Runs the duplicate-lock probe for two users, checks the queue + `orders` table to prove N clicks -> 1 job, for person 2 |
 | `test-3-gus-throughput.sh` | Runs the 500-user write load, `verify.sql`, and `measure.js` in one go, for person 3 |
+| `test-4-full-system.sh` | All three parts running together (read + write at once) — the combined shape a real flash sale has, plus integrity/throughput/cache checks on that run |
 
 Prerequisites: `winget install GrafanaLabs.k6`, then open a **new** terminal.
 
