@@ -8,11 +8,17 @@ Everything lives in this folder. Run every command **from the repo root**.
 | `orders-500.js` | **Spec write load**: 500 users race for `p-1001` (50 units) |
 | `orders-duplicate-lock.js` | Proves the entry lock collapses a triple-click into one job |
 | `products-read.js` | **Spec read load**: 1,000 concurrent users on the cached product list |
+| `cache-hit-miss.js` | Deterministic miss -> hit -> hit proof + latency, single VU |
+| `cache-stampede.js` | Fires a concurrent burst on one never-cached key; proves the rebuild mutex, not "everyone queries Postgres at once" |
 | `lost-jobs-check.js` | Catches silently-dying jobs — see "Why this one exists" below |
+| `moo_ja_test.js` | Read load + write load running together — the shape a real flash sale has, and the only script that shows how they contend |
 | `reset.sh` | Put DB + Redis back to a clean pre-load state |
 | `verify.sql` | Data Integrity Proof (the 5 required queries) |
 | `measure.js` | Throughput / p50 / p95 / failure breakdown from the queue |
 | `sweep.sh` | Automated benchmark sweep, writes CSV |
+| `test-1-moo-cache.sh` | Runs both cache scripts + a `pg_stat_user_tables.seq_scan` before/after check, prints everything person 1 needs for the report |
+| `test-2-kao-lock.sh` | Runs the duplicate-lock probe for two users, checks the queue + `orders` table to prove N clicks -> 1 job, for person 2 |
+| `test-3-gus-throughput.sh` | Runs the 500-user write load, `verify.sql`, and `measure.js` in one go, for person 3 |
 
 Prerequisites: `winget install GrafanaLabs.k6`, then open a **new** terminal.
 

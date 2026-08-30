@@ -11,3 +11,6 @@ pessimistic/c10/pool6,pessimistic,10,6,500,50,450,0,556.2,13,44,0.9,450,0,0,0
 pessimistic/c10/pool12,pessimistic,10,12,500,50,450,0,473.5,14,51,1.06,450,0,0,0
 pessimistic/c10/pool24,pessimistic,10,24,500,50,450,0,478.5,16,37,1.04,450,0,0,0
 pessimistic/c10/pool48,pessimistic,10,48,500,50,450,0,457,14,32,1.09,450,0,0,0
+pessimistic/c10,pessimistic,10,12,500,50,450,0,574.1,12,40,0.87,450,0,0,0
+optimistic/c10,optimistic,10,12,500,50,450,0,394.9,9,137,1.27,450,0,0,0
+atomic/c10,atomic,10,12,500,50,450,0,834.7,9,20,0.6,450,0,0,0
