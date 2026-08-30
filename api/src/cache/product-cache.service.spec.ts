@@ -291,6 +291,96 @@ describe('ProductCacheService', () => {
     );
   });
 
+  // X-Cache reports these per request. HIT/MISS/BYPASS have to stay
+  // distinguishable: a run of MISSes is a cold cache filling up, a run of
+  // BYPASSes is the cache not participating at all, and only the header can
+  // tell them apart once more than one client is in flight.
+  describe('getProductsPageWithStatus', () => {
+    it('reports HIT when the page was already cached', async () => {
+      const cachedBody = { status: 'success', ...emptyPage() };
+      redis.get.mockImplementation((key: string) =>
+        key === 'products:page:1:limit:10:v:0'
+          ? Promise.resolve(JSON.stringify(cachedBody))
+          : Promise.resolve(null),
+      );
+
+      const { body, cacheStatus } = await service.getProductsPageWithStatus(1, 10);
+
+      expect(cacheStatus).toBe('HIT');
+      expect(body).toEqual(cachedBody);
+      expect(productsService.findPageFromDb).not.toHaveBeenCalled();
+    });
+
+    it('reports MISS for the request that wins the lock and refills the cache', async () => {
+      productsService.findPageFromDb.mockResolvedValue(emptyPage());
+
+      const { cacheStatus } = await service.getProductsPageWithStatus(1, 10);
+
+      expect(cacheStatus).toBe('MISS');
+      expect(productsService.findPageFromDb).toHaveBeenCalledTimes(1);
+    });
+
+    it('reports BYPASS when Redis is unreachable', async () => {
+      redis.get.mockRejectedValue(new Error('ECONNREFUSED'));
+      redis.incr.mockRejectedValue(new Error('ECONNREFUSED'));
+      productsService.findPageFromDb.mockResolvedValue(emptyPage());
+
+      const { cacheStatus } = await service.getProductsPageWithStatus(1, 10);
+
+      expect(cacheStatus).toBe('BYPASS');
+    });
+
+    // The stampede case worth naming: losing the lock is not a failure. The
+    // waiter is served the winner's result and must count as a HIT, or a
+    // healthy stampede would look like a cache that is not working.
+    it('reports HIT for a request that lost the lock and got the winner result', async () => {
+      const cachedBody = { status: 'success', ...emptyPage() };
+      // Lock is already held by someone else.
+      redis.set.mockResolvedValue(null);
+      // Page is absent on arrival, present by the time we poll.
+      let polls = 0;
+      redis.get.mockImplementation((key: string) => {
+        if (key !== 'products:page:1:limit:10:v:0') return Promise.resolve(null);
+        polls += 1;
+        return Promise.resolve(polls > 1 ? JSON.stringify(cachedBody) : null);
+      });
+
+      const { body, cacheStatus } = await service.getProductsPageWithStatus(1, 10);
+
+      expect(cacheStatus).toBe('HIT');
+      expect(body).toEqual(cachedBody);
+      expect(productsService.findPageFromDb).not.toHaveBeenCalled();
+    });
+
+    // A version bump during the wait means the rebuilder's answer is already
+    // stale, so we read through — the flash-sale path, and the one that most
+    // needs to be visible as something other than a plain MISS.
+    it('reports BYPASS when the version moves while waiting for the rebuilder', async () => {
+      redis.set.mockResolvedValue(null); // lost the lock
+      let versionReads = 0;
+      redis.get.mockImplementation((key: string) => {
+        if (key === VERSION_KEY) {
+          versionReads += 1;
+          return Promise.resolve(versionReads > 1 ? '1' : '0');
+        }
+        return Promise.resolve(null);
+      });
+      productsService.findPageFromDb.mockResolvedValue(emptyPage());
+
+      const { cacheStatus } = await service.getProductsPageWithStatus(1, 10);
+
+      expect(cacheStatus).toBe('BYPASS');
+      expect(productsService.findPageFromDb).toHaveBeenCalledTimes(1);
+    });
+
+    it('getProductsPage still returns just the body', async () => {
+      productsService.findPageFromDb.mockResolvedValue(emptyPage());
+      const result = await service.getProductsPage(1, 10);
+      expect(result).toEqual({ status: 'success', ...emptyPage() });
+      expect(result).not.toHaveProperty('cacheStatus');
+    });
+  });
+
   describe('getStats', () => {
     it('computes hitRate from hits/misses and reports the current version', async () => {
       const values: Record<string, string> = {

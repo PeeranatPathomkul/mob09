@@ -3,12 +3,38 @@ import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Redis } from 'ioredis';
 import { REDIS_CLIENT } from '../redis/redis.module';
+import { resolveCacheVersionKey } from '../redis/cache-keys';
 import { ProductDto, ProductsService } from '../products/products.service';
 
 export interface ProductsPageResponse {
   status: 'success';
   data: ProductDto[];
   meta: { total: number; page: number; limit: number; totalPages: number };
+}
+
+/**
+ * How a single response was produced. Surfaced per-request as the `X-Cache`
+ * header, because `cache:hits`/`cache:misses` are process-wide totals shared
+ * by every instance and every client — you can difference them around one
+ * request only when nothing else is running, which is useless under load.
+ *
+ * BYPASS is deliberately not folded into MISS. A MISS still populated the
+ * cache for whoever comes next; a BYPASS read straight through and wrote
+ * nothing, so a run full of them means the cache is not participating at all.
+ * Telling them apart is the difference between "cold" and "broken".
+ */
+export type CacheStatus =
+  /** Served out of Redis — either found on arrival, or after waiting for the rebuilder. */
+  | 'HIT'
+  /** This request held the rebuild lock, queried Postgres, and repopulated the cache. */
+  | 'MISS'
+  /** Read through to Postgres without using or writing the cache: Redis errored, the version moved mid-wait, or the lock wait ran out. */
+  | 'BYPASS';
+
+/** A page plus how it was obtained. */
+export interface ProductsPageResult {
+  body: ProductsPageResponse;
+  cacheStatus: CacheStatus;
 }
 
 export interface CacheStats {
@@ -102,8 +128,11 @@ export class ProductCacheService {
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
     private readonly config: ConfigService,
   ) {
-    this.cacheVersionKey =
-      this.config.get<string>('CACHE_VERSION_KEY') ?? 'products:cache:version';
+    // Resolved through the shared helper, not a local literal — the worker
+    // must bump exactly this key or invalidation breaks silently.
+    this.cacheVersionKey = resolveCacheVersionKey(
+      this.config.get<string>('CACHE_VERSION_KEY'),
+    );
     this.ttlMinSeconds = Number(
       this.config.get('PRODUCT_CACHE_TTL_MIN_SECONDS') ?? 30,
     );
@@ -121,21 +150,34 @@ export class ProductCacheService {
     );
   }
 
+  /** The page alone. Unchanged for callers that do not care how it was obtained. */
   async getProductsPage(
     page: number,
     limit: number,
   ): Promise<ProductsPageResponse> {
+    const { body } = await this.getProductsPageWithStatus(page, limit);
+    return body;
+  }
+
+  /** The page plus its CacheStatus, for the controller to report as `X-Cache`. */
+  async getProductsPageWithStatus(
+    page: number,
+    limit: number,
+  ): Promise<ProductsPageResult> {
     let snapshot: PageSnapshot;
     try {
       snapshot = await this.readPage(page, limit);
     } catch (err) {
       await this.incrErrors(err);
-      return this.singleFlightFetch(page, limit);
+      return this.bypass(page, limit);
     }
 
     if (snapshot.cached) {
       this.incrCounter('cache:hits');
-      return JSON.parse(snapshot.cached) as ProductsPageResponse;
+      return {
+        body: JSON.parse(snapshot.cached) as ProductsPageResponse,
+        cacheStatus: 'HIT',
+      };
     }
 
     this.incrCounter('cache:misses');
@@ -183,7 +225,7 @@ export class ProductCacheService {
     page: number,
     limit: number,
     snapshot: PageSnapshot,
-  ): Promise<ProductsPageResponse> {
+  ): Promise<ProductsPageResult> {
     const { version, pageKey } = snapshot;
     const lockKey = this.lockKey(page, limit, version);
     const token = randomUUID();
@@ -200,7 +242,7 @@ export class ProductCacheService {
       gotLock = setResult === 'OK';
     } catch (err) {
       await this.incrErrors(err);
-      return this.singleFlightFetch(page, limit);
+      return this.bypass(page, limit);
     }
 
     if (gotLock) {
@@ -218,7 +260,8 @@ export class ProductCacheService {
           // next reader rebuilds too. Not fatal to this request.
           await this.incrErrors(err);
         }
-        return body;
+        // MISS, not BYPASS: this request is the one that refilled the cache.
+        return { body, cacheStatus: 'MISS' };
       } finally {
         await this.releaseLock(lockKey, token);
       }
@@ -234,26 +277,40 @@ export class ProductCacheService {
         polled = await this.readPage(page, limit);
       } catch (err) {
         await this.incrErrors(err);
-        return this.singleFlightFetch(page, limit);
+        return this.bypass(page, limit);
       }
 
       // The worker committed another order while we slept. Whatever the lock
       // holder is about to write belongs to the version we came in on, which
       // is already stale — stop waiting for it and read through to the DB.
       if (polled.version !== version) {
-        return this.singleFlightFetch(page, limit);
+        return this.bypass(page, limit);
       }
 
       if (polled.cached) {
         this.incrCounter('cache:hits');
-        return JSON.parse(polled.cached) as ProductsPageResponse;
+        return {
+          body: JSON.parse(polled.cached) as ProductsPageResponse,
+          cacheStatus: 'HIT',
+        };
       }
     }
 
     // Retries exhausted (rebuild is unusually slow, or the lock holder died
     // without writing). Fetch it ourselves; don't write the cache — the
     // lock holder still owns that.
-    return this.singleFlightFetch(page, limit);
+    return this.bypass(page, limit);
+  }
+
+  /** Read through to Postgres, coalesced, without touching the cache. */
+  private async bypass(
+    page: number,
+    limit: number,
+  ): Promise<ProductsPageResult> {
+    return {
+      body: await this.singleFlightFetch(page, limit),
+      cacheStatus: 'BYPASS',
+    };
   }
 
   // -- last-resort DB read, coalesced per page/limit within this instance --

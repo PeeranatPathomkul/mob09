@@ -3,6 +3,7 @@ import { Inject, Logger } from '@nestjs/common';
 import { Job } from 'bullmq';
 import { Redis } from 'ioredis';
 import { REDIS_CLIENT } from '../redis/redis.module';
+import { resolveCacheVersionKey } from '../redis/cache-keys';
 import { ORDERS_QUEUE } from './orders.module';
 import { ClaimResult, StockClaimService } from './stock-claim.service';
 import { ReplayDetectedError } from './order-errors';
@@ -48,7 +49,9 @@ export class OrdersProcessor extends WorkerHost {
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
   ) {
     super();
-    this.cacheVersionKey = process.env.CACHE_VERSION_KEY ?? 'products:cache:version';
+    // Same helper ProductCacheService uses. Readers derive their page keys
+    // from whatever this resolves to, so the two must never drift apart.
+    this.cacheVersionKey = resolveCacheVersionKey(process.env.CACHE_VERSION_KEY);
     this.logger.log(
       `concurrency=${WORKER_CONCURRENCY} strategy=${this.stockClaim.getStrategy()} cacheVersionKey=${this.cacheVersionKey}`,
     );

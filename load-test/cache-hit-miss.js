@@ -7,16 +7,23 @@ import { check, sleep } from 'k6';
 //
 //   k6 run -e BASE_URL=http://localhost:8080 load-test/cache-hit-miss.js
 //
-// LIMIT defaults to a random value so each run starts on a page key nothing
-// has warmed up yet. Pinning it (-e LIMIT=10) is fine for a repeat run, but
-// then the first request only registers as a miss if the previous run's key
-// has already aged out (TTL is 30-60s).
+// Run `bash load-test/reset.sh` first. That clears `products:*`, which is the
+// only way to guarantee the first request below is a genuine miss — see the
+// note on LIMIT.
 
 const BASE_URL = __ENV.BASE_URL || 'http://localhost:8080';
 const PAGE = parseInt(__ENV.PAGE || '1', 10);
-// 1-100 is the range the DTO accepts. Random, so a re-run within the cache
-// TTL does not land on the key the previous run just populated.
-const LIMIT = parseInt(__ENV.LIMIT || String(1 + Math.floor(Math.random() * 100)), 10);
+// The DTO snaps `limit` to one of these (ListProductsQueryDto.ALLOWED_LIMITS),
+// so these four values are the ONLY page keys a caller can produce for a given
+// page — that is the point of the clamp, but it means randomising here no
+// longer reliably lands on a cold key the way picking freely from 1-100 used
+// to. A random pick still helps on back-to-back runs; reset.sh is what
+// actually guarantees it.
+const ALLOWED_LIMITS = [10, 20, 50, 100];
+const LIMIT = parseInt(
+  __ENV.LIMIT || String(ALLOWED_LIMITS[Math.floor(Math.random() * ALLOWED_LIMITS.length)]),
+  10,
+);
 const REPEAT_HITS = parseInt(__ENV.REPEAT_HITS || '3', 10);
 
 export const options = {
@@ -108,7 +115,9 @@ export default function () {
   if (!wasMiss) {
     console.warn(
       `first request did NOT register as a miss — the key for limit=${LIMIT} was ` +
-        `already cached (a previous run inside the 30-60s TTL). Re-run, or pass a different -e LIMIT=.`,
+        `already cached (a previous run inside the 30-60s TTL). Run ` +
+        `\`bash load-test/reset.sh\` and try again; picking a different -e LIMIT= ` +
+        `only helps if it snaps to one of ${ALLOWED_LIMITS.join('/')}.`,
     );
   }
   check(null, {
