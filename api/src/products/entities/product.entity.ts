@@ -1,4 +1,10 @@
-import { Check, Column, Entity, PrimaryColumn, UpdateDateColumn } from 'typeorm';
+import {
+  Check,
+  Column,
+  Entity,
+  PrimaryColumn,
+  UpdateDateColumn,
+} from 'typeorm';
 
 @Entity('products')
 @Check('remaining_stock >= 0')

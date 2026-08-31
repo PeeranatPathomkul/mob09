@@ -13,21 +13,22 @@ import { Counter } from 'k6/metrics';
 //   -e PRODUCT_ID=p-1001        product being fought over
 //   -e DUPLICATE_USER_COUNT=5   how many users fire multiple near-simultaneous requests
 //   -e DUPLICATE_REQUESTS=3     how many requests each of those users fires at once
-//   -e SEND_QUANTITY=true       add a `quantity: 1` field to the order body
+//   -e SEND_QUANTITY=true       add a `quantity: 1` field to the order body (CreateOrderDto
+//                               doesn't require it any more; kept as an override in case that changes back)
 
 const BASE_URL = __ENV.BASE_URL || 'http://localhost:8080';
 const USER_COUNT = parseInt(__ENV.USER_COUNT || '50', 10);
 const PRODUCT_ID = __ENV.PRODUCT_ID || 'p-1001';
 const DUPLICATE_USER_COUNT = parseInt(__ENV.DUPLICATE_USER_COUNT || '5', 10);
 const DUPLICATE_REQUESTS = parseInt(__ENV.DUPLICATE_REQUESTS || '3', 10);
-// NOTE: the current CreateOrderDto still requires `quantity` (and a UUID
-// productId), which conflicts with the section 2.3 spec ("no quantity needed,
-// productId like p-1001"). Flip this on if the DTO hasn't been relaxed yet.
 const SEND_QUANTITY = (__ENV.SEND_QUANTITY || 'false') === 'true';
 
 const ordersAccepted = new Counter('orders_accepted');
-const ordersRejectedDuplicate = new Counter('orders_rejected_duplicate');
-const ordersFailedOther = new Counter('orders_failed_other');
+const ordersFailed = new Counter('orders_failed');
+// Fires only if a user's own concurrent double/triple-click produced more
+// than one distinct orderJobId — i.e. the Redis SETNX lock in
+// orders.service.ts failed to collapse them into a single idempotent reply.
+const duplicateLockViolations = new Counter('duplicate_lock_violations');
 
 export const options = {
   scenarios: {
@@ -64,7 +65,7 @@ export function setup() {
 export default function (data) {
   const me = data.tokens[(__VU - 1) % data.tokens.length];
   if (!me || !me.accessToken) {
-    ordersFailedOther.add(1);
+    ordersFailed.add(1);
     return;
   }
 
@@ -79,7 +80,7 @@ export default function (data) {
   };
 
   // A handful of users double/triple-click "buy" almost simultaneously,
-  // to exercise the API-level duplicate-request guard (SETNX/SADD lock).
+  // to exercise the API-level duplicate-request guard (SETNX lock).
   const shots = __VU <= DUPLICATE_USER_COUNT ? DUPLICATE_REQUESTS : 1;
   const body = JSON.stringify(payload);
   const requests = Array.from({ length: shots }, () => ({
@@ -91,20 +92,79 @@ export default function (data) {
 
   const responses = shots > 1 ? http.batch(requests) : [http.post(requests[0].url, requests[0].body, requests[0].params)];
 
-  responses.forEach((res, idx) => {
-    // Spec 2.3 is explicit: 202 Accepted. 200/201 here would mean the
-    // controller did the work synchronously instead of queueing it.
-    const queued = res.status === 202;
-    const rejectedAsDuplicate = res.status === 409 || res.status === 429;
-
-    check(res, {
-      [`${me.userId} attempt ${idx + 1} handled (queued or rejected as duplicate)`]: () => queued || rejectedAsDuplicate,
+  const jobIds = responses.map((res, idx) => {
+    // The API always answers 202 here, even for a duplicate — orders.service.ts
+    // treats a lock collision as "hand back the original request's result",
+    // not as an error. So 202 + a valid body is the only success shape;
+    // there is no 409/429 to accept as an alternative.
+    const okStatus = check(res, {
+      [`${me.userId} attempt ${idx + 1} is 202 Accepted`]: (r) => r.status === 202,
     });
 
-    if (queued) ordersAccepted.add(1);
-    else if (rejectedAsDuplicate) ordersRejectedDuplicate.add(1);
-    else ordersFailedOther.add(1);
+    if (!okStatus) {
+      ordersFailed.add(1);
+      return null;
+    }
+
+    const responseBody = res.json();
+    const wellFormed = check(res, {
+      [`${me.userId} attempt ${idx + 1} body has status:'processing' and an orderJobId`]: () =>
+        responseBody &&
+        responseBody.status === 'processing' &&
+        typeof responseBody.orderJobId === 'string' &&
+        responseBody.orderJobId.length > 0,
+    });
+
+    if (!wellFormed) {
+      ordersFailed.add(1);
+      return null;
+    }
+
+    ordersAccepted.add(1);
+    return responseBody.orderJobId;
   });
 
+  if (shots > 1) {
+    // The real assertion for "duplicate protection works": every concurrent
+    // submission from this one user must resolve to the *same* orderJobId —
+    // proof the lock collapsed them into one order instead of queueing N.
+    const successfulJobIds = jobIds.filter((id) => id !== null);
+    const allCollapsedToOne = successfulJobIds.length === shots && new Set(successfulJobIds).size === 1;
+
+    const collapsed = check(null, {
+      [`${me.userId}: ${shots} concurrent submissions collapsed to 1 orderJobId`]: () => allCollapsedToOne,
+    });
+
+    if (!collapsed) duplicateLockViolations.add(1);
+  }
+
   sleep(1);
+}
+
+// teardown() runs once, after every VU has finished. BullMQ processes orders
+// asynchronously, so this polls briefly to give the worker a chance to catch
+// up — it's a quick sanity check (stock must never go negative), not a
+// substitute for load-test/verify.sql or Bull Board for the authoritative
+// final numbers. It also doubles as a live check that cache invalidation
+// works: every GET here goes through the same page cache the read-load test
+// hits, so a stuck/stale value here would mean the version-bump
+// invalidation isn't wired correctly.
+export function teardown() {
+  let remainingStock = null;
+
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const res = http.get(`${BASE_URL}/api/v1/products?page=1&limit=100`);
+    if (res.status === 200) {
+      const body = res.json();
+      const product = (body.data || []).find((p) => p.productId === PRODUCT_ID);
+      if (product) remainingStock = product.remainingStock;
+    }
+    sleep(0.5);
+  }
+
+  check(null, {
+    [`${PRODUCT_ID} remainingStock is known and never negative`]: () => remainingStock !== null && remainingStock >= 0,
+  });
+
+  console.log(`${PRODUCT_ID} remainingStock after run (best-effort, worker may still be draining): ${remainingStock}`);
 }

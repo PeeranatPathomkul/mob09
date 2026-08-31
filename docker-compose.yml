@@ -23,6 +23,15 @@ services:
       context: ./api
     command: ["node", "dist/main"]
     env_file: .env
+    # Listed explicitly (see the worker service below for why) so a
+    # cache-tuning sweep can override them without editing .env or rebuilding.
+    environment:
+      - CACHE_VERSION_KEY=${CACHE_VERSION_KEY:-products:cache:version}
+      - PRODUCT_CACHE_TTL_MIN_SECONDS=${PRODUCT_CACHE_TTL_MIN_SECONDS:-30}
+      - PRODUCT_CACHE_TTL_MAX_SECONDS=${PRODUCT_CACHE_TTL_MAX_SECONDS:-60}
+      - PRODUCT_CACHE_LOCK_TTL_SECONDS=${PRODUCT_CACHE_LOCK_TTL_SECONDS:-5}
+      - PRODUCT_CACHE_LOCK_RETRY_MAX=${PRODUCT_CACHE_LOCK_RETRY_MAX:-3}
+      - PRODUCT_CACHE_LOCK_RETRY_DELAY_MS=${PRODUCT_CACHE_LOCK_RETRY_DELAY_MS:-10}
     expose:
       - "3000"
     depends_on:
@@ -101,6 +110,13 @@ services:
   k6:
     image: grafana/k6:latest
     profiles: ["loadtest"]
+    # The image runs as uid 12345 (k6), but ./load-test is owned by whoever
+    # cloned the repo -- root on the Linux box. A 0755 results/ then refuses
+    # the uid-12345 write and k6 ends the run with "could not open
+    # '/scripts/results/k6-summary.json': permission denied", losing the
+    # summary JSON after the load has already been generated. Running as root
+    # sidesteps the uid mismatch on every host we test from.
+    user: root
     volumes:
       - ./load-test:/scripts
     environment:
@@ -108,7 +124,7 @@ services:
       - RAMP=${RAMP:-0s}
       - OUT=${OUT:-/scripts/results/k6-summary.json}
     entrypoint: ["k6", "run"]
-    command: ["/scripts/orders-500.js"]
+    command: ["/scripts/moo_ja_test.js"]
 
 volumes:
   postgres_data:
