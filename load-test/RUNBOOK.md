@@ -10,6 +10,8 @@ Everything lives in this folder. Run every command **from the repo root**.
 | `products-read.js` | **Spec read load**: 1,000 concurrent users on the cached product list |
 | `cache-hit-miss.js` | Deterministic miss -> hit -> hit proof + latency, single VU |
 | `cache-stampede.js` | Fires a concurrent burst on one never-cached key; proves the rebuild mutex, not "everyone queries Postgres at once" |
+| `cache-failure-modes.js` | Every way this cache can fail, in one run, with HIT/MISS/BYPASS reported per phase (read `X-Cache` per request). Needs `reset.sh` first — phase 1 measures a cold cache |
+| `cache-blackbox.js` | **For testing another group**: estimates their cache hit-rate from the outside, by calibrating known-hit vs known-miss latency under their own load. Use when they expose no `X-Cache` / no stats endpoint |
 | `lost-jobs-check.js` | Catches silently-dying jobs — see "Why this one exists" below |
 | `moo_ja_test.js` | Read load + write load running together — the shape a real flash sale has, and the only script that shows how they contend |
 | `reset.sh` | Put DB + Redis back to a clean pre-load state |
