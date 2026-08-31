@@ -16,6 +16,8 @@ coverage/
 # logs
 *.log
 npm-debug.log*
+load-test/logs/
+load-test/results/
 
 # OS files
 .DS_Store
