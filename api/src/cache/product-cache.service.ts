@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Redis } from 'ioredis';
 import { REDIS_CLIENT } from '../redis/redis.module';
@@ -109,7 +109,7 @@ interface PageSnapshot {
  * not to maximize hit-rate.
  */
 @Injectable()
-export class ProductCacheService {
+export class ProductCacheService implements OnModuleDestroy {
   private readonly logger = new Logger(ProductCacheService.name);
 
   private readonly cacheVersionKey: string;
@@ -122,6 +122,16 @@ export class ProductCacheService {
   // request-coalescing for the last-resort DB fallback (lock retries
   // exhausted, or Redis itself is unavailable) — key is `${page}:${limit}`.
   private readonly inFlight = new Map<string, Promise<ProductsPageResponse>>();
+
+  // Hit/miss counts are accumulated here and written to Redis on an interval
+  // instead of one INCR per request. At ~6,600 reads/s that was ~6,600 extra
+  // commands a second -- on the same Redis, and the same process event loop,
+  // that POST /orders depends on -- to maintain a counter that is read once
+  // per test run.
+  private readonly pendingCounters = new Map<string, number>();
+  private flushTimer?: ReturnType<typeof setInterval>;
+
+  private static readonly COUNTER_FLUSH_MS = 1000;
 
   constructor(
     private readonly productsService: ProductsService,
@@ -148,6 +158,18 @@ export class ProductCacheService {
     this.lockRetryDelayMs = Number(
       this.config.get('PRODUCT_CACHE_LOCK_RETRY_DELAY_MS') ?? 10,
     );
+
+    this.flushTimer = setInterval(
+      () => void this.flushCounters(),
+      ProductCacheService.COUNTER_FLUSH_MS,
+    );
+    // Stats must never be the reason a process refuses to exit.
+    this.flushTimer.unref?.();
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    if (this.flushTimer) clearInterval(this.flushTimer);
+    await this.flushCounters();
   }
 
   /** The page alone. Unchanged for callers that do not care how it was obtained. */
@@ -194,6 +216,9 @@ export class ProductCacheService {
   }
 
   async getStats(): Promise<CacheStats> {
+    // Whatever is still buffered belongs in this answer.
+    await this.flushCounters();
+
     let redisAvailable = true;
 
     const safeGet = async (key: string): Promise<number> => {
@@ -387,11 +412,31 @@ export class ProductCacheService {
     }
   }
 
-  /** Fire-and-forget: a hit/miss counter must never slow down or fail a request. */
+  /** In-memory only. flushCounters() is what ever touches Redis. */
   private incrCounter(key: string): void {
-    this.redis.incr(key).catch((err) => {
-      this.logger.warn(`incr ${key} failed: ${(err as Error).message}`);
-    });
+    this.pendingCounters.set(key, (this.pendingCounters.get(key) ?? 0) + 1);
+  }
+
+  /** Write the buffered counts out as one pipelined batch. */
+  private async flushCounters(): Promise<void> {
+    if (this.pendingCounters.size === 0) return;
+
+    // Snapshot and clear before awaiting: anything counted while the write is
+    // in flight belongs to the next flush, not this one.
+    const batch = [...this.pendingCounters.entries()];
+    this.pendingCounters.clear();
+
+    try {
+      const pipeline = this.redis.pipeline();
+      for (const [key, count] of batch) pipeline.incrby(key, count);
+      await pipeline.exec();
+    } catch (err) {
+      // Hand the counts back rather than losing them; the next flush retries.
+      for (const [key, count] of batch) {
+        this.pendingCounters.set(key, (this.pendingCounters.get(key) ?? 0) + count);
+      }
+      this.logger.warn(`counter flush failed: ${(err as Error).message}`);
+    }
   }
 
   private async incrErrors(cause: unknown): Promise<void> {
