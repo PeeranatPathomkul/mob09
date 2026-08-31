@@ -18,6 +18,11 @@ coverage/
 npm-debug.log*
 load-test/logs/
 
+# benchmark output — every run appends a row, so each person's local file
+# diverges immediately. measure.js writes the header itself when the file is
+# missing, so there is nothing to keep in the repo.
+bench-results.csv
+
 # OS files
 .DS_Store
 Thumbs.db

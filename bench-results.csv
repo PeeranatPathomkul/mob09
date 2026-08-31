@@ -1,1 +1,0 @@
-label,strategy,concurrency,poolMax,total,completed,failed,retried,jobsPerSec,p50Ms,p95Ms,drainSec,outOfStock,duplicate,lockTimeout,other
