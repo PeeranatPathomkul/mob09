@@ -129,6 +129,11 @@ function classifyWrite(res, userId, attempt) {
   return false;
 }
 
+// The latency budgets. Declared once: k6 enforces them as thresholds below,
+// and the summary prints the verdict against these same numbers.
+const READ_P95_BUDGET_MS = Number(__ENV.READ_P95_BUDGET || 500);
+const WRITE_P95_BUDGET_MS = Number(__ENV.WRITE_P95_BUDGET || 2000);
+
 export const options = {
   scenarios: {
     read_load: {
@@ -150,7 +155,7 @@ export const options = {
   // 100k fast reads bury the write latency this test is designed to expose.
   thresholds: {
     'http_req_failed{scenario:read_load}': ['rate<0.01'],
-    'http_req_duration{scenario:read_load}': ['p(95)<500'],
+    'http_req_duration{scenario:read_load}': [`p(95)<${READ_P95_BUDGET_MS}`],
     // Not a judgement — the condition is always true. k6 only materialises a
     // submetric that some threshold names, and without this one the summary
     // can only report the p95 across ALL reads. That number drops when reads
@@ -159,7 +164,7 @@ export const options = {
     // actually returned a page were sitting at 746ms.
     'http_req_duration{scenario:read_load,expected_response:true}': ['p(95)>=0'],
     'http_req_failed{scenario:write_load}': ['rate<0.01'],
-    'http_req_duration{scenario:write_load}': ['p(95)<2000'],
+    'http_req_duration{scenario:write_load}': [`p(95)<${WRITE_P95_BUDGET_MS}`],
   },
 };
 
@@ -270,63 +275,128 @@ export function writeLoad(data) {
   sleep(1);
 }
 
+// The default k6 metric dump is 30 lines of which four matter. This prints
+// the four, plus the verdict, and hides every failure bucket that is empty --
+// a wall of zeroes is what made the interesting rows hard to find.
+//
+//   -e FULL=1   also print k6's own table (the JSON file always has it all)
 export function handleSummary(data) {
   const out = __ENV.OUT || 'load-test/results/moo_ja_test.json';
   const m = data.metrics;
-  const g = (name, field) => (m[name] && m[name].values[field] !== undefined ? m[name].values[field] : 0);
-  const n = (v, d = 1) => Number(v).toFixed(d);
+  const g = (name, field) =>
+    m[name] && m[name].values[field] !== undefined ? m[name].values[field] : 0;
+
+  const color = data.state && data.state.isStdOutTTY;
+  const green = (t) => (color ? `\u001b[32m${t}\u001b[0m` : t);
+  const red = (t) => (color ? `\u001b[31m${t}\u001b[0m` : t);
+  const dim = (t) => (color ? `\u001b[2m${t}\u001b[0m` : t);
+
+  const COL = 9;
+  const ms = (v) => Number(v).toFixed(1).padStart(COL);
+  // Every latency row starts with a label padded to this width; the header
+  // below is padded to the same, which is what keeps the columns lined up.
+  const LABEL_W = 20;
+  const num = (v) => String(v).padStart(7);
+  const RULE = '='.repeat(68);
+
+  // -- latency ------------------------------------------------------------
+  const lat = (scenario) =>
+    ['med', 'p(90)', 'p(95)', 'max']
+      .map((f) => ms(g(`http_req_duration{scenario:${scenario}}`, f)))
+      .join('');
 
   const readP95 = g('http_req_duration{scenario:read_load}', 'p(95)');
-  const readAnsweredP95 = g(
-    'http_req_duration{scenario:read_load,expected_response:true}',
-    'p(95)',
-  );
   const writeP95 = g('http_req_duration{scenario:write_load}', 'p(95)');
+  const ratio = readP95 > 0 ? (writeP95 / readP95).toFixed(1) : '-';
 
-  // The headline of this test is the gap between the two, so state it rather
-  // than leaving the reader to find two rows in the metric dump.
-  const ratio = readP95 > 0 ? writeP95 / readP95 : 0;
+  // -- outcome buckets: only the ones that actually happened --------------
+  const bucket = (label, metric, note) => ({
+    label,
+    count: g(metric, 'count'),
+    note,
+  });
+  const readFailures = [
+    bucket('no connection', 'reads_no_connection', 'status 0, never reached the server'),
+    bucket('bad gateway', 'reads_bad_gateway', '502/504, nginx got no answer'),
+    bucket('unavailable', 'reads_unavailable', '503'),
+    bucket('rate limited', 'reads_rate_limited', '429'),
+    bucket('server error', 'reads_server_error', '5xx from the app'),
+    bucket('other', 'reads_failed_other', ''),
+  ];
+  const writeRejects = [
+    bucket('rate limited', 'orders_rate_limited', '429'),
+    bucket('auth refused', 'orders_rejected_auth', '401/403'),
+    bucket('bad request', 'orders_rejected_bad_request', '400/404/422'),
+    bucket('server error', 'orders_server_error', '5xx'),
+    bucket('unclassified', 'orders_failed_other', ''),
+  ];
+  const shown = (list) => list.filter((b) => b.count > 0);
+  const section = (title, list) => {
+    const hits = shown(list);
+    if (hits.length === 0) return [`  ${title.padEnd(16)}${green('none')}`];
+    return [`  ${title}`].concat(
+      hits.map(
+        (b) => `    ${red(b.label.padEnd(16))}${num(b.count)}   ${dim(b.note)}`,
+      ),
+    );
+  };
+
+  // -- verdict ------------------------------------------------------------
+  const verdict = (label, value, budget) => {
+    const ok = value < budget;
+    const tag = ok ? green('PASS') : red('FAIL');
+    return `    ${tag}  ${label.padEnd(11)}${ms(value)} ms   ${dim('budget ' + budget)}`;
+  };
+
+  const durationSec = (data.state.testRunDurationMs / 1000).toFixed(1);
 
   const report = [
     '',
-    '  READ vs WRITE UNDER COMBINED LOAD',
-    `    readers            ${READ_VUS} VUs for ${READ_DURATION}`,
-    `    writers            ${USER_COUNT} VUs, starting at +${WRITE_START}`,
+    RULE,
+    '  FLASH SALE  -  READ + WRITE UNDER COMBINED LOAD',
+    `  ${BASE_URL}${' '.repeat(Math.max(1, 50 - BASE_URL.length))}${durationSec}s total`,
+    RULE,
     '',
-    `    GET  /products     p95 ${n(readP95)} ms   (all reads)`,
-    `    GET  /products     p95 ${n(readAnsweredP95)} ms   (reads that answered)`,
-    `    POST /orders       p95 ${n(writeP95)} ms`,
-    `    write is           ${n(ratio)}x the read latency`,
+    `  LOAD       read   ${String(READ_VUS).padStart(4)} VUs for ${READ_DURATION}`,
+    `             write  ${String(USER_COUNT).padStart(4)} VUs from +${WRITE_START}   ` +
+      dim(`(first ${Math.min(DUPLICATE_USER_COUNT, USER_COUNT)} users fire ${DUPLICATE_REQUESTS}x)`),
     '',
-    '    reads that failed — read the counts before the latency above: a',
-    '    refused connection is faster than any real answer, so failures pull',
-    '    the all-reads p95 down rather than up:',
-    `      no connection    ${g('reads_no_connection', 'count')}   (status 0 — never reached the server)`,
-    `      bad gateway      ${g('reads_bad_gateway', 'count')}   (502/504 — nginx could not get an answer)`,
-    `      unavailable      ${g('reads_unavailable', 'count')}   (503)`,
-    `      rate limited     ${g('reads_rate_limited', 'count')}   (429)`,
-    `      server error     ${g('reads_server_error', 'count')}   (5xx from the app)`,
-    `      other            ${g('reads_failed_other', 'count')}`,
+    '  LATENCY (ms)'.padEnd(LABEL_W) +
+      ['med', 'p90', 'p95', 'max'].map((h) => h.padStart(COL)).join(''),
+    '    GET  /products'.padEnd(LABEL_W) + lat('read_load'),
+    '    POST /orders'.padEnd(LABEL_W) + lat('write_load'),
+    ' '.repeat(LABEL_W) + dim(`write p95 is ${ratio}x the read p95`),
     '',
-    '    answered correctly — 202/409/410 are all legitimate replies:',
-    `      accepted         ${g('orders_accepted', 'count')}   (202)`,
-    `      duplicate user   ${g('orders_rejected_duplicate', 'count')}   (409)`,
-    `      sold out         ${g('orders_sold_out', 'count')}   (410)`,
+    `  THROUGHPUT   ${Math.round(g('http_reqs', 'rate'))} req/s` +
+      `      ${g('http_reqs', 'count')} requests`,
     '',
-    '    rejected — every line below is the system failing, not passing:',
-    `      rate limited     ${g('orders_rate_limited', 'count')}   (429)`,
-    `      auth refused     ${g('orders_rejected_auth', 'count')}   (401/403)`,
-    `      bad request      ${g('orders_rejected_bad_request', 'count')}   (400/404/422)`,
-    `      server error     ${g('orders_server_error', 'count')}   (5xx)`,
-    `      unclassified     ${g('orders_failed_other', 'count')}`,
+    '  ORDERS       ' + green('202 queued'.padEnd(14)) + num(g('orders_accepted', 'count')),
+    '               ' + '409 duplicate'.padEnd(14) + num(g('orders_rejected_duplicate', 'count')),
+    '               ' + '410 sold out'.padEnd(14) + num(g('orders_sold_out', 'count')),
+    dim('               all three are correct answers, not failures'),
     '',
-    '    202 counts jobs queued, not units sold — confirm the real outcome',
-    '    in the database with load-test/verify.sql',
-    '',
-  ].join('\n');
+  ]
+    .concat(section('READ FAILURES', readFailures))
+    .concat(section('WRITE REJECTED', writeRejects))
+    .concat([
+      '',
+      '  VERDICT',
+      verdict('read  p95', readP95, READ_P95_BUDGET_MS),
+      verdict('write p95', writeP95, WRITE_P95_BUDGET_MS),
+      '',
+      dim('  202 means queued, not sold. Confirm units with load-test/verify.sql'),
+      dim('  Latency varies run to run on a loaded host -- take the median of 5.'),
+      RULE,
+      '',
+    ])
+    .join('\n');
+
+  const full = __ENV.FULL === '1' || __ENV.FULL === 'true';
 
   return {
-    stdout: textSummary(data, { indent: ' ', enableColors: true }) + '\n' + report,
+    stdout: full
+      ? textSummary(data, { indent: ' ', enableColors: true }) + '\n' + report
+      : report,
     [out]: JSON.stringify(data, null, 2),
   };
 }
