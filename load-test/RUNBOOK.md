@@ -11,6 +11,9 @@ Everything lives in this folder. Run every command **from the repo root**.
 | `cache-hit-miss.js` | Deterministic miss -> hit -> hit proof + latency, single VU |
 | `cache-stampede.js` | Fires a concurrent burst on one never-cached key; proves the rebuild mutex, not "everyone queries Postgres at once" |
 | `cache-failure-modes.js` | Every way this cache can fail, in one run, with HIT/MISS/BYPASS reported per phase (read `X-Cache` per request). Needs `reset.sh` first — phase 1 measures a cold cache |
+| `pagination-integrity.js` | **Spec 2.2 correctness**: meta arithmetic, page disjointness, cross-limit agreement, every documented field + type, out-of-range pages — asserted on every response while `LOAD_VUS` readers hammer the endpoint |
+| `cache-invalidation.js` | **Spec 2.2 invalidation, as a number**: staleness in ms per round *per page size* (catches partial invalidation), exactly-one decrement per order, and stock-never-climbs as a hard failure — all under read load |
+| `order-concurrency.js` | **Spec 2.3 business rules**: burst duplicate, one user buying two products at once, `quantity` field ignored, duplicate *after the lock expires*, oversell + async-controller proof. Judges units consumed, not status codes, so it runs against any group |
 | `cache-blackbox.js` | **For testing another group**: estimates their cache hit-rate from the outside, by calibrating known-hit vs known-miss latency under their own load. Use when they expose no `X-Cache` / no stats endpoint |
 | `lost-jobs-check.js` | Catches silently-dying jobs — see "Why this one exists" below |
 | `moo_ja_test.js` | Read load + write load running together — the shape a real flash sale has, and the only script that shows how they contend |
@@ -64,6 +67,27 @@ k6 run -e BASE_URL=http://localhost:8080 load-test/orders-500.js
 k6 run -e BASE_URL=http://localhost:8080 -e PRODUCT_ID=p-1001 \
        -e DUPLICATE_COUNT=3 load-test/orders-duplicate-lock.js
 ```
+
+### Correctness under load (run these against another group too)
+
+```bash
+# spec 2.2 response + pagination contract, asserted under 200 concurrent readers
+k6 run -e BASE_URL=http://localhost:8080 load-test/pagination-integrity.js
+
+# spec 2.2 invalidation: how many ms the cache lies, per page size
+bash load-test/reset.sh
+k6 run -e BASE_URL=http://localhost:8080 load-test/cache-invalidation.js
+
+# spec 2.3 business rules. Takes ~2.5 min: phase D deliberately waits out the
+# 30s entry lock, which is the only way to test the duplicate the lock cannot
+# catch. -e DELAY_SEC= must stay above the target's lock TTL.
+bash load-test/reset.sh
+k6 run -e BASE_URL=http://localhost:8080 load-test/order-concurrency.js
+```
+
+All three read stock through `GET /api/v1/products` only — no Redis, no
+Postgres, no `X-Cache` — so they work unchanged against a group whose
+internals you cannot see.
 
 ## 4. Wait for the queue to drain
 
