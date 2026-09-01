@@ -10,14 +10,31 @@ type RedisMock = {
   set: jest.Mock;
   incr: jest.Mock;
   eval: jest.Mock;
+  pipeline: jest.Mock;
+  /** Records what the counter flush pushed, so tests can assert on it. */
+  __incrby: jest.Mock;
 };
 
 function createRedisMock(): RedisMock {
+  const incrby = jest.fn();
   const mock: RedisMock = {
     get: jest.fn().mockResolvedValue(null),
     set: jest.fn().mockResolvedValue('OK'),
     incr: jest.fn().mockResolvedValue(1),
     eval: jest.fn(),
+    // Hit/miss counts are buffered in the service and written out as one
+    // pipelined batch, so the mock has to offer a chainable pipeline.
+    pipeline: jest.fn(() => {
+      const chain = {
+        incrby: (key: string, count: number) => {
+          incrby(key, count);
+          return chain;
+        },
+        exec: async () => [],
+      };
+      return chain;
+    }),
+    __incrby: incrby,
   };
 
   // The service reads the version and the page for it through a single Lua
@@ -50,6 +67,11 @@ function lockReleaseCalls(redis: RedisMock): unknown[][] {
   );
 }
 
+/** [key, count] pairs the buffered counter flush wrote to Redis. */
+function flushedCounts(redis: RedisMock): unknown[][] {
+  return redis.__incrby.mock.calls as unknown[][];
+}
+
 function emptyPage(page = 1, limit = 10): ProductsPage {
   return { data: [], meta: { total: 0, page, limit, totalPages: 1 } };
 }
@@ -73,7 +95,9 @@ describe('ProductCacheService', () => {
     );
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // Also clears the counter-flush interval the constructor started.
+    await service.onModuleDestroy();
     jest.useRealTimers();
   });
 
@@ -94,7 +118,10 @@ describe('ProductCacheService', () => {
 
     expect(result).toEqual(cachedBody);
     expect(productsService.findPageFromDb).not.toHaveBeenCalled();
-    expect(redis.incr).toHaveBeenCalledWith('cache:hits');
+    // Counted in memory: a read must not cost a Redis round trip for stats.
+    expect(redis.incr).not.toHaveBeenCalledWith('cache:hits');
+    await service.onModuleDestroy();
+    expect(flushedCounts(redis)).toContainEqual(['cache:hits', 1]);
   });
 
   it('cache miss, lock acquired: queries the DB once, writes the page cache, releases the lock', async () => {
@@ -117,7 +144,9 @@ describe('ProductCacheService', () => {
       expect.any(Number),
     );
     expect(lockReleaseCalls(redis)).toHaveLength(1); // compare-and-delete
-    expect(redis.incr).toHaveBeenCalledWith('cache:misses');
+    expect(redis.incr).not.toHaveBeenCalledWith('cache:misses');
+    await service.onModuleDestroy();
+    expect(flushedCounts(redis)).toContainEqual(['cache:misses', 1]);
     expect(result).toEqual({ status: 'success', ...emptyPage() });
   });
 

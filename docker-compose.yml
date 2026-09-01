@@ -45,6 +45,25 @@ services:
   api3:
     <<: *api
 
+  # Dedicated write instance. nginx routes POST /api/v1/orders here, so the
+  # enqueue path no longer shares a Node event loop -- or the single ioredis
+  # connection in redis.module.ts -- with the read load on api1-3.
+  #
+  # Reads outnumber writes about 200:1 in moo_ja_test.js (222,204 vs 1,040),
+  # and every write await landed behind that queue: POST /orders measures
+  # p95 208ms on its own but 8,549ms once 1,000 readers are running. This
+  # container is nearly idle by comparison, so the extra CPU cost is small --
+  # what it buys is an event loop the writes do not have to share.
+  api-write:
+    <<: *api
+
+  # Second write instance. The write burst is 500 users arriving at once, so
+  # the cost is per-request CPU in one Node process, not Redis or Postgres:
+  # 540 requests drained in ~2.4s through a single api-write (p95 2,296ms).
+  # That work cannot be made much cheaper, but it can be shared.
+  api-write2:
+    <<: *api
+
   worker:
     build:
       context: ./api
@@ -87,6 +106,10 @@ services:
       - api1
       - api2
       - api3
+      # Required: nginx resolves every upstream host at startup and exits
+      # with "host not found in upstream" if this one is not up yet.
+      - api-write
+      - api-write2
     restart: unless-stopped
 
   # Load generator. Behind the "loadtest" profile so `docker compose up` never
